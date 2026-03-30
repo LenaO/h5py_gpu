@@ -541,7 +541,7 @@ class GPUDataset:
             return arr
         return _numpy_to_gpu(arr)
 
-    def read_selection_chunked(self, sel, out=None, stream=None):
+    def read_selection_chunked(self, sel, out=None, stream=None, transform=None):
         """Read a slice selection from a chunked dataset to the GPU,
         processing one HDF5 chunk at a time with double-buffering.
 
@@ -555,6 +555,9 @@ class GPUDataset:
            directly to its correct position in the output array using
            ``memcpy2DAsync`` with the chunk row-pitch as the source stride —
            no intermediate CPU extraction step is needed.
+        4. If *transform* is provided, it is enqueued on the same CUDA stream
+           immediately after the H2D copy, so compute overlaps with the CPU
+           reading the next chunk.
 
         Double-buffering overlaps step 2 for chunk *i+1* with step 3 for
         chunk *i*.
@@ -571,6 +574,14 @@ class GPUDataset:
         stream : cupy.cuda.Stream, optional
             CUDA stream for H2D transfers.  A new non-blocking stream is
             created when *None*.
+        transform : callable, optional
+            Element-wise operation applied to each tile on the GPU **after**
+            the H2D transfer, on the same stream.  Called as
+            ``out[out_sel] = transform(out[out_sel])`` inside a
+            ``with stream:`` block.  Any CuPy ufunc or lambda works::
+
+                gpu_ds.read_selection_chunked(sel, transform=cp.sqrt)
+                gpu_ds.read_selection_chunked(sel, transform=lambda x: x * 2.0)
 
         Returns
         -------
@@ -653,17 +664,24 @@ class GPUDataset:
                 local_sel, out, out_sel, stream,
             )
 
-            # 2. While DMA runs, read the next chunk on CPU
+            # 2. Enqueue optional element-wise transform (ordered after H2D
+            #    on the same stream; runs while CPU reads the next chunk)
+            if transform is not None:
+                with stream:
+                    out[out_sel] = transform(out[out_sel])
+
+            # 3. While H2D + transform run, read the next chunk on CPU
             if i + 1 < len(touched):
                 nxt_file_sel, nxt_shape = touched[i + 1][0], touched[i + 1][1]
                 _fill_buf(nxt, nxt_file_sel, nxt_shape)
 
-            # 3. Wait for DMA before reusing cur buffer
+            # 4. Wait for H2D (and transform) before reusing cur buffer
             stream.synchronize()
 
         return out
 
-    def read_double_buffered(self, chunk_size=None, out=None, stream=None):
+    def read_double_buffered(self, chunk_size=None, out=None, stream=None,
+                             transform=None):
         """Read the entire dataset to the GPU using double-buffered I/O.
 
         Overlaps HDF5 storage reads with host-to-device (H2D) DMA transfers
@@ -673,17 +691,19 @@ class GPUDataset:
 
             Iteration i:
               CPU  ──▶  [submit async H2D buf_i → GPU]
-                        [read chunk i+1 from HDF5 → buf_{1-i}]   ← overlaps GPU DMA
+                        [optional transform(out[i]) on stream]    (non-blocking)
+                        [read chunk i+1 from HDF5 → buf_{1-i}]   ← overlaps DMA+compute
                         [stream.synchronize()]
 
         Because the source buffers are page-locked (pinned), the CUDA DMA
         engine can carry out the H2D transfer autonomously while the CPU
         thread is busy reading the next HDF5 chunk.  The effective transfer
-        time per chunk approaches ``max(T_io, T_h2d)`` rather than
-        ``T_io + T_h2d``.
+        time per chunk approaches ``max(T_io, T_h2d + T_compute)`` rather than
+        ``T_io + T_h2d + T_compute``.
 
         This method reads along the *first* axis in equal-sized chunks and
-        assembles the result into a single output array.
+        assembles the result into a single output array.  Works for any
+        number of dimensions, including 1-D datasets.
 
         Parameters
         ----------
@@ -699,6 +719,14 @@ class GPUDataset:
         stream : cupy.cuda.Stream, optional
             CUDA stream used for async H2D transfers.  If *None* a new
             non-blocking stream is created.
+        transform : callable, optional
+            Element-wise operation applied to each row-band on the GPU
+            **after** its H2D transfer, on the same stream.  Called as
+            ``out[start:end] = transform(out[start:end])`` inside a
+            ``with stream:`` block::
+
+                gpu_ds.read_double_buffered(transform=cp.sqrt)
+                gpu_ds.read_double_buffered(transform=lambda x: x * 2.0)
 
         Returns
         -------
@@ -778,7 +806,12 @@ class GPUDataset:
                 stream.ptr,
             )
 
-            # 2. While DMA runs, read the next chunk into the other buffer
+            # 2. Enqueue optional element-wise transform on the same stream
+            if transform is not None:
+                with stream:
+                    out[start:end] = transform(out[start:end])
+
+            # 3. While H2D + transform run, read the next chunk into the other buffer
             if i + 1 < len(chunk_starts):
                 next_start = chunk_starts[i + 1]
                 next_end = min(next_start + chunk_size, n_rows)
@@ -788,12 +821,12 @@ class GPUDataset:
                     source_sel=np.s_[next_start:next_end],
                 )
 
-            # 3. Wait for H2D to finish before cur buffer can be reused
+            # 4. Wait for H2D (and transform) before cur buffer can be reused
             stream.synchronize()
 
         return out
 
-    def read_chunks_to_gpu(self, out=None, stream=None):
+    def read_chunks_to_gpu(self, out=None, stream=None, transform=None):
         """Read a chunked HDF5 dataset to the GPU one tile at a time,
         with double-buffering.
 
@@ -806,7 +839,8 @@ class GPUDataset:
 
             iteration i:
               CPU  ──▶  [submit memcpy2DAsync  tile_i → out[sel_i]]  (non-blocking)
-                        [dataset[sel_{i+1}] → pinned_{nxt}]           ← overlaps DMA
+                        [optional transform(out[sel_i]) on stream]    (non-blocking)
+                        [dataset[sel_{i+1}] → pinned_{nxt}]           ← overlaps DMA+compute
                         [stream.synchronize()]
 
         ``memcpy2DAsync`` is used for 2-D tiles (and once per depth-slice for
@@ -824,6 +858,14 @@ class GPUDataset:
         stream : cupy.cuda.Stream, optional
             CUDA stream for H2D transfers.  A new non-blocking stream is
             created when *None*.
+        transform : callable, optional
+            Element-wise operation applied to each tile on the GPU **after**
+            the H2D transfer, on the same stream.  Called as
+            ``out[sel] = transform(out[sel])`` inside a ``with stream:``
+            block.  Any CuPy ufunc or lambda works::
+
+                gpu_ds.read_chunks_to_gpu(transform=cp.sqrt)
+                gpu_ds.read_chunks_to_gpu(transform=lambda x: x * 2.0)
 
         Returns
         -------
@@ -891,14 +933,136 @@ class GPUDataset:
             # 1. Submit async H2D: cur pinned buf → out[sel]
             _async_h2d_tile(bufs[cur].ctypes.data, tile_shape, out, sel, stream)
 
-            # 2. While DMA runs, read the next tile from HDF5 on CPU
+            # 2. Enqueue optional element-wise transform on the same stream
+            #    (ordered after H2D; runs while CPU reads the next tile)
+            if transform is not None:
+                with stream:
+                    out[sel] = transform(out[sel])
+
+            # 3. While H2D + transform run, read the next tile from HDF5 on CPU
             if i + 1 < len(tiles):
                 next_sel, _ = tiles[i + 1]
                 next_tile = dataset[next_sel]
                 np.copyto(bufs[nxt][:next_tile.size], next_tile.ravel())
 
-            # 3. Wait for DMA before cur buffer can be reused
+            # 4. Wait for H2D (and transform) before cur buffer can be reused
             stream.synchronize()
+
+        return out
+
+    def read_chunks_parallel(self, out=None, n_streams=2, transform=None):
+        """Read a chunked HDF5 dataset to the GPU using multiple CUDA streams.
+
+        Distributes HDF5 chunks across *n_streams* independent CUDA streams in
+        round-robin order.  Each stream independently pipelines its H2D
+        transfer and optional compute, so up to *n_streams* tiles can have
+        active GPU work simultaneously:
+
+        .. code-block:: text
+
+            stream 0: [H2D tile0] [compute tile0]               [H2D tile2] ...
+            stream 1:             [H2D tile1]   [compute tile1]             ...
+            CPU:      [read0]  [read1]  [read2]  [read3] ...
+
+        Compared to :meth:`read_chunks_to_gpu` (single stream), this better
+        utilises GPUs with multiple DMA copy engines and hides compute latency
+        behind concurrent transfers on other streams.
+
+        Supports 2-D and 3-D HDF5-chunked datasets.
+
+        Parameters
+        ----------
+        out : cupy.ndarray, optional
+            Pre-allocated C-contiguous output array matching the dataset's
+            shape and dtype.  Allocated automatically if *None*.
+        n_streams : int, optional
+            Number of independent CUDA streams.  Default is 2.  Values of
+            4–8 can improve throughput when *transform* is compute-heavy.
+        transform : callable, optional
+            Element-wise operation applied to each tile after its H2D
+            transfer, on the same stream as the transfer.  Called as
+            ``out[sel] = transform(out[sel])`` inside a ``with stream:``
+            block::
+
+                gpu_ds.read_chunks_parallel(n_streams=4, transform=cp.sqrt)
+
+        Returns
+        -------
+        cupy.ndarray
+
+        Raises
+        ------
+        ValueError
+            If the dataset is not HDF5-chunked, or has ``ndim`` other than
+            2 or 3.
+        """
+        dataset = object.__getattribute__(self, "_gpu_dataset")
+
+        if dataset.chunks is None:
+            raise ValueError(
+                "Dataset is not HDF5-chunked. "
+                "Use read_double_buffered() for contiguous datasets."
+            )
+        if dataset.ndim not in (2, 3):
+            raise ValueError(
+                f"read_chunks_parallel supports 2-D and 3-D datasets, "
+                f"got ndim={dataset.ndim}"
+            )
+
+        shape  = dataset.shape
+        chunks = dataset.chunks
+        dtype  = np.dtype(dataset.dtype)
+
+        if out is None:
+            out = cp.empty(shape, dtype=dtype)
+        else:
+            if not isinstance(out, cp.ndarray):
+                raise TypeError(f"out must be a cupy.ndarray, got {type(out)!r}")
+            if out.shape != shape or out.dtype != dtype:
+                raise ValueError(
+                    f"out shape/dtype {out.shape}/{out.dtype} does not match "
+                    f"dataset {shape}/{dtype}"
+                )
+            if not out.flags["C_CONTIGUOUS"]:
+                raise ValueError("out must be C-contiguous")
+
+        n_streams = max(1, int(n_streams))
+        streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
+
+        # One pinned buffer per stream — each sized for one full (max) chunk
+        max_elems = int(np.prod(chunks))
+        pms  = [cp.cuda.alloc_pinned_memory(max_elems * dtype.itemsize)
+                for _ in range(n_streams)]
+        bufs = [np.frombuffer(pm, dtype=dtype, count=max_elems) for pm in pms]
+
+        tiles = list(_iter_tiles(shape, chunks))
+        if not tiles:
+            return out
+
+        for i, (sel, tile_shape) in enumerate(tiles):
+            sid    = i % n_streams
+            stream = streams[sid]
+            buf    = bufs[sid]
+
+            # Wait for this stream's previous work (H2D + compute from n_streams
+            # iterations ago) before reusing its pinned buffer
+            stream.synchronize()
+
+            # Read this tile from HDF5 into the stream's pinned buffer (CPU)
+            tile = dataset[sel]
+            np.copyto(buf[:tile.size], tile.ravel())
+
+            # Submit async H2D on this stream
+            _async_h2d_tile(buf.ctypes.data, tile_shape, out, sel, stream)
+
+            # Enqueue optional transform immediately after H2D on the same stream
+            if transform is not None:
+                with stream:
+                    out[sel] = transform(out[sel])
+
+        # Drain all streams
+        for s in streams:
+            s.synchronize()
 
         return out
 
