@@ -1067,6 +1067,278 @@ class GPUDataset:
         return out
 
     # ------------------------------------------------------------------
+    # Reduction methods  (HDF5 → per-chunk GPU reduction → scalar)
+    # ------------------------------------------------------------------
+
+    def reduce_chunks(self, reduce_fn, combine_fn=None, transform=None,
+                      stream=None):
+        """Compute a reduction over a chunked dataset without loading it fully
+        to GPU memory.
+
+        For each HDF5 chunk the method:
+
+        1. Reads the full chunk into a pinned host buffer.
+        2. H2D-transfers it asynchronously into a reusable GPU temp buffer.
+        3. Optionally applies *transform* on the same stream.
+        4. Applies *reduce_fn* and stores one value in a ``partial`` array.
+        5. Reads the next chunk on the CPU while 2–4 run on the GPU.
+
+        Finally *combine_fn* is applied to ``partial`` to produce the result.
+
+        .. code-block:: text
+
+            iteration i:
+              [H2D chunk_i → gpu_temp]          (async)
+              [transform(gpu_temp)]              (async, same stream)
+              [partial[i] = reduce_fn(gpu_temp)] (async, same stream)
+              [CPU reads chunk i+1]              ← overlaps all GPU work
+              [stream.synchronize()]
+
+        GPU memory usage is ``O(chunk_size)`` for the temp buffer plus
+        ``O(n_chunks)`` for the partial results — the full dataset is never
+        resident on the GPU at once.
+
+        Parameters
+        ----------
+        reduce_fn : callable
+            Applied to each tile (a ``cupy.ndarray``) and must return a
+            scalar ``cupy.ndarray``  (0-D).  Any CuPy reducing ufunc works
+            directly::
+
+                gpu_ds.reduce_chunks(cp.sum)
+                gpu_ds.reduce_chunks(cp.max)
+                gpu_ds.reduce_chunks(cp.min)
+
+        combine_fn : callable, optional
+            Applied to the 1-D ``partial`` array (shape ``(n_chunks,)``) to
+            produce the final result.  Defaults to *reduce_fn*, which is
+            correct for *sum*, *max*, and *min*.
+
+            For a global **mean** use::
+
+                n = int(np.prod(dataset.shape))
+                gpu_ds.reduce_chunks(cp.sum,
+                                     combine_fn=lambda x: cp.sum(x) / n)
+
+            .. warning::
+                ``combine_fn=cp.mean`` gives a wrong result when chunks have
+                different sizes (edge tiles), because it averages the per-chunk
+                means rather than the per-element values.  Use the sum-then-
+                divide pattern above instead.
+
+        transform : callable, optional
+            Applied to each tile before *reduce_fn* (on the same stream).
+
+        stream : cupy.cuda.Stream, optional
+            CUDA stream.  A new non-blocking stream is created when *None*.
+
+        Returns
+        -------
+        cupy.ndarray
+            0-D (scalar) result, or whatever shape *combine_fn* returns.
+
+        Raises
+        ------
+        ValueError
+            If the dataset is not HDF5-chunked, or has ``ndim`` other than
+            2 or 3.
+        """
+        dataset = object.__getattribute__(self, "_gpu_dataset")
+
+        if dataset.chunks is None:
+            raise ValueError(
+                "Dataset is not HDF5-chunked. "
+                "Use reduce_double_buffered() for contiguous datasets."
+            )
+        if dataset.ndim not in (2, 3):
+            raise ValueError(
+                f"reduce_chunks supports 2-D and 3-D datasets, "
+                f"got ndim={dataset.ndim}"
+            )
+
+        if combine_fn is None:
+            combine_fn = reduce_fn
+
+        if stream is None:
+            stream = cp.cuda.Stream(non_blocking=True)
+
+        shape  = dataset.shape
+        chunks = dataset.chunks
+        dtype  = np.dtype(dataset.dtype)
+
+        tiles = list(_iter_tiles(shape, chunks))
+        if not tiles:
+            return None
+
+        # Probe the output dtype of reduce_fn
+        _probe = reduce_fn(cp.zeros(1, dtype=dtype))
+        out_dtype = _probe.dtype
+
+        max_elems = int(np.prod(chunks))
+
+        # Two pinned host buffers for double-buffered CPU reads
+        pms  = [cp.cuda.alloc_pinned_memory(max_elems * dtype.itemsize)
+                for _ in range(2)]
+        bufs = [np.frombuffer(pm, dtype=dtype, count=max_elems) for pm in pms]
+
+        # Single reusable GPU temp buffer (safe: always synced before reuse)
+        gpu_temp = cp.empty(max_elems, dtype=dtype)
+
+        # One partial result per tile
+        partial = cp.empty(len(tiles), dtype=out_dtype)
+
+        # Prime: read first tile into buf[0]
+        first_sel, first_shape = tiles[0]
+        first_tile = dataset[first_sel]
+        np.copyto(bufs[0][:first_tile.size], first_tile.ravel())
+
+        for i, (sel, tile_shape) in enumerate(tiles):
+            cur = i % 2
+            nxt = 1 - cur
+            n = int(np.prod(tile_shape))
+
+            # 1. H2D: pinned buf[cur] → gpu_temp[:n]  (async)
+            cp.cuda.runtime.memcpyAsync(
+                gpu_temp.data.ptr,
+                bufs[cur].ctypes.data,
+                n * dtype.itemsize,
+                cp.cuda.runtime.memcpyHostToDevice,
+                stream.ptr,
+            )
+
+            # 2. Enqueue transform (optional) + reduce → partial[i]
+            #    All ordered after H2D on the same stream.
+            with stream:
+                tile_view = gpu_temp[:n].reshape(tile_shape)
+                if transform is not None:
+                    tile_view = transform(tile_view)
+                partial[i] = reduce_fn(tile_view)
+
+            # 3. Read next tile on CPU (overlaps H2D + compute on GPU)
+            if i + 1 < len(tiles):
+                next_sel, next_shape = tiles[i + 1]
+                next_tile = dataset[next_sel]
+                np.copyto(bufs[nxt][:next_tile.size], next_tile.ravel())
+
+            # 4. Sync before reusing gpu_temp and pinned buf
+            stream.synchronize()
+
+        return combine_fn(partial)
+
+    def reduce_double_buffered(self, reduce_fn, combine_fn=None, transform=None,
+                               chunk_size=None, stream=None):
+        """Compute a reduction over a dataset using row-band double-buffering.
+
+        Mirrors :meth:`reduce_chunks` but works for any number of dimensions,
+        including 1-D datasets and contiguous (non-chunked) datasets, by
+        processing the data in equal-sized row bands along the first axis.
+
+        Parameters
+        ----------
+        reduce_fn : callable
+            Applied to each row band.  Must return a scalar ``cupy.ndarray``.
+        combine_fn : callable, optional
+            Applied to the partial-results array.  Defaults to *reduce_fn*.
+        transform : callable, optional
+            Applied to each band before *reduce_fn*, on the same stream.
+        chunk_size : int, optional
+            Number of rows per band.  Defaults to ``dataset.chunks[0]`` for
+            HDF5-chunked datasets, or ``max(1, nrows // 8)`` otherwise.
+        stream : cupy.cuda.Stream, optional
+
+        Returns
+        -------
+        cupy.ndarray
+            Scalar (0-D) result, or whatever shape *combine_fn* returns.
+
+        Raises
+        ------
+        ValueError
+            If the dataset has zero dimensions.
+        """
+        dataset = object.__getattribute__(self, "_gpu_dataset")
+
+        if dataset.ndim == 0:
+            raise ValueError("reduce_double_buffered requires at least 1 dimension")
+
+        if combine_fn is None:
+            combine_fn = reduce_fn
+
+        n_rows    = dataset.shape[0]
+        row_shape = dataset.shape[1:]
+        dtype     = np.dtype(dataset.dtype)
+        row_nbytes = int(np.prod(row_shape, dtype=np.intp)) * dtype.itemsize
+
+        if chunk_size is None:
+            hdf5_chunks = dataset.chunks
+            chunk_size = hdf5_chunks[0] if hdf5_chunks else max(1, n_rows // 8)
+        chunk_size = min(chunk_size, n_rows)
+
+        if stream is None:
+            stream = cp.cuda.Stream(non_blocking=True)
+
+        chunk_starts = list(range(0, n_rows, chunk_size))
+
+        # Probe output dtype
+        _probe = reduce_fn(cp.zeros(1, dtype=dtype))
+        out_dtype = _probe.dtype
+
+        # Two pinned host buffers (double-buffered CPU reads)
+        buf_shape = (chunk_size,) + row_shape
+        _pm = [None, None]
+        bufs = [None, None]
+        for k in range(2):
+            _pm[k], bufs[k] = _alloc_pinned_like(buf_shape, dtype)
+
+        # Reusable GPU temp buffer (one band at a time)
+        gpu_temp = cp.empty(buf_shape, dtype=dtype)
+
+        # Partial results: one per band
+        partial = cp.empty(len(chunk_starts), dtype=out_dtype)
+
+        # Prime: read first band
+        end0 = min(chunk_size, n_rows)
+        dataset.read_direct(bufs[0][:end0], source_sel=np.s_[0:end0])
+
+        for i, start in enumerate(chunk_starts):
+            end = min(start + chunk_size, n_rows)
+            actual_rows = end - start
+            cur = i % 2
+            nxt = 1 - cur
+            nbytes = actual_rows * row_nbytes
+
+            # 1. H2D: cur pinned band → gpu_temp  (async)
+            cp.cuda.runtime.memcpyAsync(
+                gpu_temp.data.ptr,
+                bufs[cur].ctypes.data,
+                nbytes,
+                cp.cuda.runtime.memcpyHostToDevice,
+                stream.ptr,
+            )
+
+            # 2. Enqueue transform (optional) + reduce → partial[i]
+            with stream:
+                band_view = gpu_temp[:actual_rows]
+                if transform is not None:
+                    band_view = transform(band_view)
+                partial[i] = reduce_fn(band_view)
+
+            # 3. Read next band on CPU (overlaps H2D + reduce)
+            if i + 1 < len(chunk_starts):
+                next_start = chunk_starts[i + 1]
+                next_end   = min(next_start + chunk_size, n_rows)
+                next_rows  = next_end - next_start
+                dataset.read_direct(
+                    bufs[nxt][:next_rows],
+                    source_sel=np.s_[next_start:next_end],
+                )
+
+            # 4. Sync before reusing gpu_temp and pinned buf
+            stream.synchronize()
+
+        return combine_fn(partial)
+
+    # ------------------------------------------------------------------
     # Write methods  (GPU → HDF5)
     # ------------------------------------------------------------------
 
@@ -1463,6 +1735,208 @@ class GPUDataset:
     def __contains__(self, item):
         dataset = object.__getattribute__(self, "_gpu_dataset")
         return item in dataset
+
+
+# ---------------------------------------------------------------------------
+# GPUCachedDataset
+# ---------------------------------------------------------------------------
+
+class GPUCachedDataset:
+    """A :class:`GPUDataset` that keeps the full dataset resident in GPU memory.
+
+    On first access (or when :meth:`preload` is called), the dataset is loaded
+    to the GPU using the most efficient available read path.  All subsequent
+    indexing, transforms, and reductions operate entirely on the GPU —
+    **no disk I/O after the initial load**.
+
+    Use :class:`GPUCachedDataset` when you need to:
+
+    * Apply multiple transforms or reductions to the same data without
+      re-reading from disk each time.
+    * Repeatedly index into the dataset.
+    * Pipeline several GPU operations after a single load.
+
+    For datasets too large to fit in GPU memory, use the streaming methods
+    on :class:`GPUDataset` (:meth:`~GPUDataset.reduce_chunks`,
+    :meth:`~GPUDataset.read_chunks_to_gpu`, etc.) instead.
+
+    Parameters
+    ----------
+    dataset : h5py.Dataset or GPUDataset
+        The source dataset.
+    preload : bool, optional
+        If *True* (default), load to GPU immediately.  If *False*, defer
+        loading until the first access.
+
+    Examples
+    --------
+    Eager load and compute::
+
+        with GPUCachedDataset(f["ds"]) as cached:
+            total   = cached.reduce(cp.sum)
+            maximum = cached.reduce(cp.max)
+            subset  = cached[10:50, 5:55]   # pure GPU slice, no I/O
+
+    Lazy load, chained transform + reduce::
+
+        cached = GPUCachedDataset(f["ds"], preload=False)
+        result = cached.transform(cp.sqrt).reduce(cp.sum)
+        cached.free()
+    """
+
+    def __init__(self, dataset, preload=True):
+        if isinstance(dataset, GPUDataset):
+            self._gpu_ds = dataset
+        elif isinstance(dataset, Dataset):
+            self._gpu_ds = GPUDataset(dataset)
+        else:
+            raise TypeError(
+                f"Expected GPUDataset or h5py.Dataset, got {type(dataset)!r}"
+            )
+        self._array = None
+        if preload:
+            self.preload()
+
+    # ------------------------------------------------------------------
+    # Loading / lifecycle
+    # ------------------------------------------------------------------
+
+    def preload(self):
+        """Load the full dataset into GPU memory (no-op if already loaded).
+
+        Uses :meth:`~GPUDataset.read_chunks_to_gpu` for 2-D/3-D HDF5-chunked
+        datasets (tile-by-tile double-buffered), and
+        :meth:`~GPUDataset.read_double_buffered` for everything else.
+
+        Returns
+        -------
+        self
+            For chaining.
+        """
+        if self._array is None:
+            ds = object.__getattribute__(self._gpu_ds, "_gpu_dataset")
+            if ds.chunks is not None and ds.ndim in (2, 3):
+                self._array = self._gpu_ds.read_chunks_to_gpu()
+            else:
+                self._array = self._gpu_ds.read_double_buffered()
+        return self
+
+    def free(self):
+        """Release the cached GPU array and free GPU memory."""
+        self._array = None
+
+    def reload(self):
+        """Free the current cache and reload from disk.
+
+        Returns
+        -------
+        self
+        """
+        self.free()
+        return self.preload()
+
+    # ------------------------------------------------------------------
+    # Access to the cached array
+    # ------------------------------------------------------------------
+
+    @property
+    def array(self):
+        """The GPU-resident :class:`cupy.ndarray`.
+
+        Triggers :meth:`preload` on first access if the data has not been
+        loaded yet.
+        """
+        if self._array is None:
+            self.preload()
+        return self._array
+
+    def __getitem__(self, args):
+        """Index into the cached GPU array — pure GPU, no disk I/O."""
+        return self.array[args]
+
+    # ------------------------------------------------------------------
+    # GPU-only compute (no I/O after initial load)
+    # ------------------------------------------------------------------
+
+    def reduce(self, reduce_fn, transform=None):
+        """Apply *reduce_fn* to the cached array (pure GPU, no I/O).
+
+        Parameters
+        ----------
+        reduce_fn : callable
+            E.g. ``cp.sum``, ``cp.max``, ``cp.min``.  Applied to the full
+            cached array (or to the result of *transform*).
+        transform : callable, optional
+            Applied to a **temporary view** of the cached array before the
+            reduction.  The cache itself is not modified — use
+            :meth:`transform` if you want to update it.
+
+        Returns
+        -------
+        cupy.ndarray
+            Scalar (0-D) result.
+
+        Examples
+        --------
+        ::
+
+            total = cached.reduce(cp.sum)
+            rms   = cached.reduce(lambda x: cp.sqrt(cp.mean(x ** 2)))
+            sum_sqrt = cached.reduce(cp.sum, transform=cp.sqrt)
+        """
+        arr = self.array
+        if transform is not None:
+            arr = transform(arr)
+        return reduce_fn(arr)
+
+    def transform(self, fn):
+        """Apply *fn* to the cached array and update the cache with the result.
+
+        Parameters
+        ----------
+        fn : callable
+            Called as ``fn(array)`` and must return a :class:`cupy.ndarray`.
+            The returned array replaces the cache.
+
+        Returns
+        -------
+        self
+            For chaining::
+
+                cached.transform(cp.sqrt).transform(lambda x: x * 2.0)
+
+        Notes
+        -----
+        Out-of-place transforms (e.g. ``cp.sqrt``) allocate a new GPU array
+        and the old one is freed.  In-place operations (``array *= 2``) avoid
+        the extra allocation but must be written as a lambda::
+
+            cached.transform(lambda x: x.__imul__(2.0) or x)
+        """
+        self._array = fn(self.array)
+        return self
+
+    # ------------------------------------------------------------------
+    # Context manager
+    # ------------------------------------------------------------------
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.free()
+
+    # ------------------------------------------------------------------
+    # Attribute delegation and representation
+    # ------------------------------------------------------------------
+
+    def __getattr__(self, name):
+        return getattr(self._gpu_ds, name)
+
+    def __repr__(self):
+        loaded = self._array is not None
+        status = f"loaded {list(self._array.shape)}" if loaded else "not loaded"
+        return f"<GPUCachedDataset [{status}] wrapping {self._gpu_ds!r}>"
 
 
 # ---------------------------------------------------------------------------

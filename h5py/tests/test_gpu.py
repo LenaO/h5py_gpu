@@ -163,6 +163,24 @@ class TestGPUDataset(TestCase):
         result = gpu_ds.read_double_buffered(chunk_size=10, stream=stream)
         np.testing.assert_array_equal(cupy.asnumpy(result), data)
 
+    def test_double_buffered_transform_1d(self):
+        """transform applied correctly on a 1-D dataset."""
+        data = np.arange(1, 257, dtype=np.float32)
+        self.f.create_dataset("ds", data=data)
+        result = GPUDataset(self.f["ds"]).read_double_buffered(
+            chunk_size=32, transform=lambda x: x * 2.0
+        )
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), data * 2.0)
+
+    def test_double_buffered_transform_sqrt(self):
+        """CuPy ufunc (sqrt) works as transform on 2-D dataset."""
+        data = np.arange(1, 65, dtype=np.float32).reshape(8, 8)
+        self.f.create_dataset("ds", data=data)
+        result = GPUDataset(self.f["ds"]).read_double_buffered(
+            chunk_size=2, transform=cupy.sqrt
+        )
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), np.sqrt(data))
+
     def test_double_buffered_scalar_raises(self):
         """Scalar datasets raise ValueError."""
         self.f.create_dataset("sc", data=np.float32(3.14))
@@ -511,6 +529,309 @@ class TestGPUGroup(TestCase):
         assert "GPUGroup" in repr(gpu_f)
 
 
+class TestTransformAndParallel(TestCase):
+    """Tests for the transform parameter and read_chunks_parallel."""
+
+    def setUp(self):
+        self.f = h5py.File(self.mktemp(), "w")
+
+    def tearDown(self):
+        if self.f:
+            self.f.close()
+
+    # ------------------------------------------------------------------
+    # read_chunks_to_gpu  with transform
+    # ------------------------------------------------------------------
+
+    def test_chunks_transform_scale(self):
+        """transform applied after H2D produces correct scaled values."""
+        data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        result = GPUDataset(self.f["ds"]).read_chunks_to_gpu(
+            transform=lambda x: x * 2.0
+        )
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), data * 2.0)
+
+    def test_chunks_transform_sqrt(self):
+        """CuPy ufunc (cp.sqrt) works as transform."""
+        data = np.arange(1, 64 * 64 + 1, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        result = GPUDataset(self.f["ds"]).read_chunks_to_gpu(
+            transform=cupy.sqrt
+        )
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), np.sqrt(data))
+
+    def test_chunks_transform_none_unchanged(self):
+        """transform=None (default) leaves data unchanged."""
+        data = np.random.rand(32, 32).astype(np.float32)
+        self.f.create_dataset("ds", data=data, chunks=(8, 8))
+        result = GPUDataset(self.f["ds"]).read_chunks_to_gpu(transform=None)
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), data)
+
+    def test_chunks_transform_3d(self):
+        """transform works on 3-D datasets."""
+        data = np.arange(8 * 16 * 16, dtype=np.float32).reshape(8, 16, 16) + 1.0
+        self.f.create_dataset("ds", data=data, chunks=(2, 8, 8))
+        result = GPUDataset(self.f["ds"]).read_chunks_to_gpu(
+            transform=lambda x: x + 10.0
+        )
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), data + 10.0)
+
+    # ------------------------------------------------------------------
+    # read_selection_chunked  with transform
+    # ------------------------------------------------------------------
+
+    def test_sel_transform_scale(self):
+        """transform applied to each touched chunk sub-region."""
+        data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        sel = np.s_[10:50, 5:55]
+        result = GPUDataset(self.f["ds"]).read_selection_chunked(
+            sel, transform=lambda x: x * 3.0
+        )
+        np.testing.assert_array_almost_equal(
+            cupy.asnumpy(result), data[sel] * 3.0
+        )
+
+    def test_sel_transform_sqrt(self):
+        data = np.arange(1, 64 * 64 + 1, dtype=np.float64).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        sel = np.s_[8:40, 8:40]
+        result = GPUDataset(self.f["ds"]).read_selection_chunked(
+            sel, transform=cupy.sqrt
+        )
+        np.testing.assert_array_almost_equal(
+            cupy.asnumpy(result), np.sqrt(data[sel])
+        )
+
+    # ------------------------------------------------------------------
+    # read_chunks_parallel
+    # ------------------------------------------------------------------
+
+    def test_parallel_2d_n2(self):
+        """2-D dataset, n_streams=2, no transform — matches direct read."""
+        data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        result = GPUDataset(self.f["ds"]).read_chunks_parallel(n_streams=2)
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    def test_parallel_2d_n4(self):
+        """n_streams=4 still produces correct result."""
+        data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        result = GPUDataset(self.f["ds"]).read_chunks_parallel(n_streams=4)
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    def test_parallel_non_divisible(self):
+        """Edge tiles handled correctly with multiple streams."""
+        data = np.arange(50 * 70, dtype=np.int32).reshape(50, 70)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        result = GPUDataset(self.f["ds"]).read_chunks_parallel(n_streams=3)
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    def test_parallel_3d(self):
+        """3-D dataset with multiple streams."""
+        data = np.arange(8 * 16 * 16, dtype=np.float32).reshape(8, 16, 16)
+        self.f.create_dataset("ds", data=data, chunks=(2, 8, 8))
+        result = GPUDataset(self.f["ds"]).read_chunks_parallel(n_streams=2)
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    def test_parallel_transform(self):
+        """transform applied correctly with multiple streams."""
+        data = np.arange(1, 64 * 64 + 1, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        result = GPUDataset(self.f["ds"]).read_chunks_parallel(
+            n_streams=2, transform=cupy.sqrt
+        )
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), np.sqrt(data))
+
+    def test_parallel_n1_same_as_single(self):
+        """n_streams=1 gives the same result as read_chunks_to_gpu."""
+        data = np.random.rand(32, 32).astype(np.float32)
+        self.f.create_dataset("ds", data=data, chunks=(8, 8))
+        gpu_ds = GPUDataset(self.f["ds"])
+        r1 = gpu_ds.read_chunks_to_gpu()
+        r2 = gpu_ds.read_chunks_parallel(n_streams=1)
+        np.testing.assert_array_almost_equal(cupy.asnumpy(r1), cupy.asnumpy(r2))
+
+    def test_parallel_preallocated_out(self):
+        """Fills a pre-allocated output array."""
+        data = np.arange(32 * 32, dtype=np.float32).reshape(32, 32)
+        self.f.create_dataset("ds", data=data, chunks=(8, 8))
+        gpu_ds = GPUDataset(self.f["ds"])
+        out = cupy.empty((32, 32), dtype=np.float32)
+        result = gpu_ds.read_chunks_parallel(out=out, n_streams=2)
+        assert result is out
+        np.testing.assert_array_equal(cupy.asnumpy(out), data)
+
+    def test_parallel_raises_on_unchunked(self):
+        self.f.create_dataset("ds", data=np.zeros((8, 8)))
+        with pytest.raises(ValueError, match="not HDF5-chunked"):
+            GPUDataset(self.f["ds"]).read_chunks_parallel()
+
+    def test_parallel_raises_on_1d(self):
+        self.f.create_dataset("ds", data=np.zeros(32), chunks=(8,))
+        with pytest.raises(ValueError, match="ndim"):
+            GPUDataset(self.f["ds"]).read_chunks_parallel()
+
+
+class TestReductions(TestCase):
+    """Tests for reduce_chunks and reduce_double_buffered."""
+
+    def setUp(self):
+        self.f = h5py.File(self.mktemp(), "w")
+
+    def tearDown(self):
+        if self.f:
+            self.f.close()
+
+    # ------------------------------------------------------------------
+    # reduce_chunks  (2-D)
+    # ------------------------------------------------------------------
+
+    def test_reduce_chunks_sum_2d(self):
+        data = np.arange(1, 64 * 64 + 1, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        result = GPUDataset(self.f["ds"]).reduce_chunks(cupy.sum)
+        np.testing.assert_allclose(float(result), float(data.sum()), rtol=1e-5)
+
+    def test_reduce_chunks_max_2d(self):
+        data = np.random.rand(64, 64).astype(np.float32)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        result = GPUDataset(self.f["ds"]).reduce_chunks(cupy.max)
+        np.testing.assert_allclose(float(result), float(data.max()), rtol=1e-5)
+
+    def test_reduce_chunks_min_2d(self):
+        data = np.random.rand(64, 64).astype(np.float32)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        result = GPUDataset(self.f["ds"]).reduce_chunks(cupy.min)
+        np.testing.assert_allclose(float(result), float(data.min()), rtol=1e-5)
+
+    def test_reduce_chunks_mean_2d(self):
+        """Global mean via sum / n_elements (correct for unequal edge chunks)."""
+        data = np.random.rand(50, 70).astype(np.float64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        n = int(np.prod(data.shape))
+        result = GPUDataset(self.f["ds"]).reduce_chunks(
+            cupy.sum, combine_fn=lambda x: cupy.sum(x) / n
+        )
+        np.testing.assert_allclose(float(result), float(data.mean()), rtol=1e-5)
+
+    def test_reduce_chunks_sum_3d(self):
+        data = np.random.rand(8, 16, 16).astype(np.float32)
+        self.f.create_dataset("ds", data=data, chunks=(2, 8, 8))
+        result = GPUDataset(self.f["ds"]).reduce_chunks(cupy.sum)
+        np.testing.assert_allclose(float(result), float(data.sum()), rtol=1e-4)
+
+    def test_reduce_chunks_max_3d(self):
+        data = np.random.rand(8, 16, 16).astype(np.float32)
+        self.f.create_dataset("ds", data=data, chunks=(2, 8, 8))
+        result = GPUDataset(self.f["ds"]).reduce_chunks(cupy.max)
+        np.testing.assert_allclose(float(result), float(data.max()), rtol=1e-5)
+
+    def test_reduce_chunks_non_divisible(self):
+        """Edge tiles (dataset not divisible by chunk size)."""
+        data = np.random.rand(50, 70).astype(np.float32)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        result = GPUDataset(self.f["ds"]).reduce_chunks(cupy.sum)
+        np.testing.assert_allclose(float(result), float(data.sum()), rtol=1e-4)
+
+    def test_reduce_chunks_single_tile(self):
+        """Dataset fits in one chunk."""
+        data = np.arange(1, 17, dtype=np.float32).reshape(4, 4)
+        self.f.create_dataset("ds", data=data, chunks=(4, 4))
+        result = GPUDataset(self.f["ds"]).reduce_chunks(cupy.sum)
+        np.testing.assert_allclose(float(result), float(data.sum()), rtol=1e-5)
+
+    def test_reduce_chunks_with_transform(self):
+        """Sum of sqrt(data) via transform."""
+        data = np.random.rand(64, 64).astype(np.float32) + 0.01
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        result = GPUDataset(self.f["ds"]).reduce_chunks(
+            cupy.sum, transform=cupy.sqrt
+        )
+        np.testing.assert_allclose(
+            float(result), float(np.sqrt(data).sum()), rtol=1e-4
+        )
+
+    def test_reduce_chunks_raises_on_unchunked(self):
+        self.f.create_dataset("ds", data=np.zeros((8, 8)))
+        with pytest.raises(ValueError, match="not HDF5-chunked"):
+            GPUDataset(self.f["ds"]).reduce_chunks(cupy.sum)
+
+    def test_reduce_chunks_raises_on_1d(self):
+        self.f.create_dataset("ds", data=np.zeros(32), chunks=(8,))
+        with pytest.raises(ValueError, match="ndim"):
+            GPUDataset(self.f["ds"]).reduce_chunks(cupy.sum)
+
+    # ------------------------------------------------------------------
+    # reduce_double_buffered  (any ndim, including 1-D)
+    # ------------------------------------------------------------------
+
+    def test_reduce_dbl_sum_1d(self):
+        data = np.arange(1, 257, dtype=np.float32)
+        self.f.create_dataset("ds", data=data)
+        result = GPUDataset(self.f["ds"]).reduce_double_buffered(
+            cupy.sum, chunk_size=32
+        )
+        np.testing.assert_allclose(float(result), float(data.sum()), rtol=1e-5)
+
+    def test_reduce_dbl_max_1d(self):
+        data = np.random.rand(256).astype(np.float32)
+        self.f.create_dataset("ds", data=data)
+        result = GPUDataset(self.f["ds"]).reduce_double_buffered(cupy.max)
+        np.testing.assert_allclose(float(result), float(data.max()), rtol=1e-5)
+
+    def test_reduce_dbl_min_1d(self):
+        data = np.random.rand(256).astype(np.float32)
+        self.f.create_dataset("ds", data=data)
+        result = GPUDataset(self.f["ds"]).reduce_double_buffered(cupy.min)
+        np.testing.assert_allclose(float(result), float(data.min()), rtol=1e-5)
+
+    def test_reduce_dbl_sum_2d(self):
+        data = np.random.rand(64, 32).astype(np.float64)
+        self.f.create_dataset("ds", data=data)
+        result = GPUDataset(self.f["ds"]).reduce_double_buffered(
+            cupy.sum, chunk_size=8
+        )
+        np.testing.assert_allclose(float(result), float(data.sum()), rtol=1e-10)
+
+    def test_reduce_dbl_mean_1d(self):
+        """Global mean via sum/n."""
+        data = np.random.rand(256).astype(np.float64)
+        self.f.create_dataset("ds", data=data)
+        n = data.size
+        result = GPUDataset(self.f["ds"]).reduce_double_buffered(
+            cupy.sum, combine_fn=lambda x: cupy.sum(x) / n, chunk_size=32
+        )
+        np.testing.assert_allclose(float(result), float(data.mean()), rtol=1e-10)
+
+    def test_reduce_dbl_uneven_chunks(self):
+        """Correct when data length is not a multiple of chunk_size."""
+        data = np.arange(100, dtype=np.float32)
+        self.f.create_dataset("ds", data=data)
+        result = GPUDataset(self.f["ds"]).reduce_double_buffered(
+            cupy.sum, chunk_size=30
+        )
+        np.testing.assert_allclose(float(result), float(data.sum()), rtol=1e-5)
+
+    def test_reduce_dbl_with_transform(self):
+        """Sum of squares via transform=lambda x: x**2."""
+        data = np.random.rand(128).astype(np.float32) + 0.01
+        self.f.create_dataset("ds", data=data)
+        result = GPUDataset(self.f["ds"]).reduce_double_buffered(
+            cupy.sum, transform=lambda x: x ** 2, chunk_size=16
+        )
+        np.testing.assert_allclose(
+            float(result), float((data ** 2).sum()), rtol=1e-4
+        )
+
+    def test_reduce_dbl_scalar_raises(self):
+        self.f.create_dataset("sc", data=np.float32(1.0))
+        with pytest.raises(ValueError, match="1 dimension"):
+            GPUDataset(self.f["sc"]).reduce_double_buffered(cupy.sum)
+
+
 class TestGPUWrite(TestCase):
     """Tests for the GPU → HDF5 write methods."""
 
@@ -753,3 +1074,230 @@ class TestGPUFile(TestCase):
             pass
         with GPUFile(path) as f:
             assert "GPUFile" in repr(f)
+
+
+# ---------------------------------------------------------------------------
+# GPUCachedDataset
+# ---------------------------------------------------------------------------
+
+from h5py.gpu import GPUCachedDataset  # noqa: E402
+
+
+class TestGPUCachedDataset(TestCase):
+    def setUp(self):
+        self.f = h5py.File(self.mktemp(), "w")
+
+    def tearDown(self):
+        if self.f:
+            self.f.close()
+
+    # ------------------------------------------------------------------
+    # Preload behaviour
+    # ------------------------------------------------------------------
+
+    def test_eager_preload_2d_chunked(self):
+        """Eager preload (default) fills _array via read_chunks_to_gpu."""
+        data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        cached = GPUCachedDataset(self.f["ds"])
+        assert cached._array is not None
+        np.testing.assert_array_equal(cupy.asnumpy(cached._array), data)
+
+    def test_eager_preload_1d(self):
+        """1-D unchunked dataset is loaded via read_double_buffered."""
+        data = np.arange(256, dtype=np.float64)
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"])
+        assert cached._array is not None
+        np.testing.assert_array_almost_equal(cupy.asnumpy(cached._array), data)
+
+    def test_lazy_preload(self):
+        """preload=False defers loading until first access."""
+        data = np.arange(32, dtype=np.float32)
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"], preload=False)
+        assert cached._array is None
+        # Trigger load via .array property
+        arr = cached.array
+        assert cached._array is not None
+        np.testing.assert_array_almost_equal(cupy.asnumpy(arr), data)
+
+    def test_preload_noop_if_already_loaded(self):
+        """Calling preload() again does not replace the existing array."""
+        data = np.ones(32, dtype=np.float32)
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"])
+        first = cached._array
+        cached.preload()   # second call
+        assert cached._array is first  # same object, no reload
+
+    # ------------------------------------------------------------------
+    # __getitem__
+    # ------------------------------------------------------------------
+
+    def test_getitem_slice(self):
+        """Indexing into the cache returns the correct sub-array."""
+        data = np.arange(64, dtype=np.float32)
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"])
+        result = cached[10:30]
+        assert isinstance(result, cupy.ndarray)
+        np.testing.assert_array_equal(cupy.asnumpy(result), data[10:30])
+
+    def test_getitem_2d(self):
+        """2-D slice on a 2-D dataset."""
+        data = np.arange(8 * 8, dtype=np.float32).reshape(8, 8)
+        self.f.create_dataset("ds", data=data, chunks=(4, 4))
+        cached = GPUCachedDataset(self.f["ds"])
+        result = cached[2:5, 1:6]
+        np.testing.assert_array_equal(cupy.asnumpy(result), data[2:5, 1:6])
+
+    # ------------------------------------------------------------------
+    # reduce
+    # ------------------------------------------------------------------
+
+    def test_reduce_sum(self):
+        """reduce(cp.sum) returns the correct total."""
+        data = np.arange(1, 65, dtype=np.float64)
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"])
+        result = float(cached.reduce(cupy.sum))
+        assert abs(result - float(np.sum(data))) < 1e-6
+
+    def test_reduce_max(self):
+        data = np.arange(100, dtype=np.float32)
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"])
+        assert float(cached.reduce(cupy.max)) == pytest.approx(99.0)
+
+    def test_reduce_min(self):
+        data = np.arange(100, dtype=np.float32) + 5.0
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"])
+        assert float(cached.reduce(cupy.min)) == pytest.approx(5.0)
+
+    def test_reduce_with_transform(self):
+        """transform kwarg is applied before reduce, cache is not mutated."""
+        data = np.array([1.0, 4.0, 9.0, 16.0], dtype=np.float64)
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"])
+        result = float(cached.reduce(cupy.sum, transform=cupy.sqrt))
+        expected = float(np.sum(np.sqrt(data)))
+        assert abs(result - expected) < 1e-6
+        # Cache should still contain original data (not sqrt'd)
+        np.testing.assert_array_almost_equal(cupy.asnumpy(cached.array), data)
+
+    # ------------------------------------------------------------------
+    # transform (in-place cache update)
+    # ------------------------------------------------------------------
+
+    def test_transform_updates_cache(self):
+        """transform() replaces the cached array with the transformed version."""
+        data = np.array([1.0, 4.0, 9.0], dtype=np.float64)
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"])
+        cached.transform(cupy.sqrt)
+        np.testing.assert_array_almost_equal(
+            cupy.asnumpy(cached.array), np.sqrt(data)
+        )
+
+    def test_transform_chaining(self):
+        """transform() returns self, enabling chaining."""
+        data = np.array([1.0, 4.0, 9.0], dtype=np.float64)
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"])
+        result = cached.transform(cupy.sqrt).transform(lambda x: x * 2.0)
+        assert result is cached
+        np.testing.assert_array_almost_equal(
+            cupy.asnumpy(cached.array), np.sqrt(data) * 2.0
+        )
+
+    def test_transform_then_reduce(self):
+        """Chained transform + reduce computes the correct value."""
+        data = np.array([1.0, 4.0, 9.0, 16.0], dtype=np.float64)
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"])
+        result = float(cached.transform(cupy.sqrt).reduce(cupy.sum))
+        expected = float(np.sum(np.sqrt(data)))
+        assert abs(result - expected) < 1e-6
+
+    # ------------------------------------------------------------------
+    # free / reload
+    # ------------------------------------------------------------------
+
+    def test_free_releases_cache(self):
+        data = np.arange(16, dtype=np.float32)
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"])
+        assert cached._array is not None
+        cached.free()
+        assert cached._array is None
+
+    def test_reload_refreshes_data(self):
+        """reload() frees and re-reads; result matches original data."""
+        data = np.arange(16, dtype=np.float32)
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"])
+        first_ptr = cached._array.data.ptr
+        returned = cached.reload()
+        assert returned is cached
+        assert cached._array is not None
+        # May or may not be the same allocation; data must be correct
+        np.testing.assert_array_almost_equal(cupy.asnumpy(cached.array), data)
+
+    # ------------------------------------------------------------------
+    # Context manager
+    # ------------------------------------------------------------------
+
+    def test_context_manager_frees(self):
+        """Exiting the context manager frees the cached array."""
+        data = np.arange(32, dtype=np.float32)
+        self.f.create_dataset("ds", data=data)
+        with GPUCachedDataset(self.f["ds"]) as cached:
+            assert cached._array is not None
+        assert cached._array is None
+
+    # ------------------------------------------------------------------
+    # __repr__
+    # ------------------------------------------------------------------
+
+    def test_repr_loaded(self):
+        data = np.zeros((4, 4), dtype=np.float32)
+        self.f.create_dataset("ds", data=data, chunks=(2, 2))
+        cached = GPUCachedDataset(self.f["ds"])
+        r = repr(cached)
+        assert "GPUCachedDataset" in r
+        assert "loaded" in r
+        assert "4" in r   # shape present
+
+    def test_repr_not_loaded(self):
+        data = np.zeros(8, dtype=np.float32)
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"], preload=False)
+        r = repr(cached)
+        assert "not loaded" in r
+
+    # ------------------------------------------------------------------
+    # Error handling
+    # ------------------------------------------------------------------
+
+    def test_wrong_type_raises(self):
+        with pytest.raises(TypeError, match="GPUDataset or h5py.Dataset"):
+            GPUCachedDataset("not a dataset")
+
+    def test_wraps_gpu_dataset(self):
+        """Accepts a GPUDataset directly (not just h5py.Dataset)."""
+        data = np.arange(16, dtype=np.float32)
+        self.f.create_dataset("ds", data=data)
+        gpu_ds = GPUDataset(self.f["ds"])
+        cached = GPUCachedDataset(gpu_ds)
+        np.testing.assert_array_almost_equal(cupy.asnumpy(cached.array), data)
+
+    def test_attribute_delegation(self):
+        """Attributes not on GPUCachedDataset are delegated to the GPUDataset."""
+        data = np.arange(16, dtype=np.float32)
+        self.f.create_dataset("ds", data=data)
+        cached = GPUCachedDataset(self.f["ds"])
+        # .shape and .dtype come from the underlying h5py.Dataset via GPUDataset
+        assert cached.shape == (16,)
+        assert cached.dtype == np.float32
