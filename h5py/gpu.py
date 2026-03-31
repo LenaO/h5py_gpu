@@ -50,6 +50,7 @@ Basic usage::
 """
 
 import itertools
+import zlib as _zlib
 import numpy as np
 
 try:
@@ -57,6 +58,15 @@ try:
     _CUPY_AVAILABLE = True
 except ImportError:
     _CUPY_AVAILABLE = False
+
+# HDF5 filter codes
+_FILTER_DEFLATE  = 1      # gzip / zlib
+_FILTER_SHUFFLE  = 2      # byte-shuffle pre-filter
+_FILTER_LZ4      = 32004  # LZ4 (HDF5 plugin)
+_FILTER_ZSTD     = 32015  # Zstd (HDF5 plugin)
+
+# Lazy-compiled CUDA unshuffle kernel (built on first use)
+_UNSHUFFLE_KERNEL = None
 
 from ._hl.dataset import Dataset
 from ._hl.group import Group
@@ -479,6 +489,195 @@ def _async_h2d_tile(src_ptr, tile_shape, out, sel, stream):
         raise ValueError(
             f"_async_h2d_tile: unsupported ndim={len(tile_shape)} (2 or 3 only)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Compression helpers  (for read_chunks_compressed)
+# ---------------------------------------------------------------------------
+
+def _get_unshuffle_kernel():
+    """Return the lazily-compiled CuPy RawKernel that reverses HDF5's shuffle filter.
+
+    HDF5 shuffle rearranges bytes so that byte *b* of every element is grouped
+    together before compression:
+
+        shuffled = [b0_of_elem0, b0_of_elem1, ..., b1_of_elem0, b1_of_elem1, ...]
+
+    This kernel writes the original interleaved byte order back::
+
+        dst[elem_idx * element_size + byte_pos] = src[byte_pos * n_elements + elem_idx]
+    """
+    global _UNSHUFFLE_KERNEL
+    if _UNSHUFFLE_KERNEL is None:
+        _UNSHUFFLE_KERNEL = cp.RawKernel(r"""
+extern "C" __global__ void unshuffle(
+    const unsigned char* __restrict__ src,
+    unsigned char*       __restrict__ dst,
+    int n_elements,
+    int element_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_elements * element_size) return;
+    int elem_idx = idx / element_size;
+    int byte_pos = idx % element_size;
+    dst[idx] = src[byte_pos * n_elements + elem_idx];
+}
+""", "unshuffle")
+    return _UNSHUFFLE_KERNEL
+
+
+# Map filter_name → (nvcomp_algorithm, header_bytes_to_skip).
+# Only filters where GPU decompression is possible are listed.
+# Requires `nvidia-nvcomp-cu12` (or cu13) installed:
+#   pip install nvidia-nvcomp-cu12  --extra-index-url https://pypi.nvidia.com
+_NVCOMP_FILTER_MAP = {
+    "lz4":  ("lz4",  16),   # HDF5 LZ4 plugin prepends 16 bytes of metadata
+    "zstd": ("zstd",  0),   # Standard Zstandard frames, no header to skip
+}
+
+
+def _get_nvcomp_decompressor(filter_name, uncompressed_nb, stream_ptr):
+    """Return a ``(nvidia.nvcomp.Codec, header_skip)`` pair for GPU decompression,
+    or ``None`` if nvCOMP is not installed or the filter is not supported.
+
+    GPU decompression is available for:
+
+    * **LZ4** (HDF5 filter 32004, ``hdf5plugin.LZ4``): the standard LZ4 block
+      format produced by the HDF5 LZ4 plugin is compatible with
+      ``nvcomp.Codec(algorithm='lz4', bitstream_kind=BitstreamKind.RAW)``.
+      The HDF5 LZ4 plugin prepends a 16-byte metadata header; we skip it.
+
+    * **Zstd** (HDF5 filter 32015, ``hdf5plugin.Zstd``): HDF5 Zstd produces
+      standard RFC 8878 frames that nvCOMP decompresses directly with
+      ``nvcomp.Codec(algorithm='zstd', bitstream_kind=BitstreamKind.RAW)``.
+
+    **gzip / deflate** (HDF5 filter 1) is *not* supported for GPU
+    decompression — nvCOMP's ``deflate`` algorithm uses a GPU-specific
+    bitstream that is incompatible with RFC 1951 DEFLATE / RFC 1950 zlib
+    produced by HDF5.  Those chunks are decompressed on CPU with
+    ``zlib.decompress``.
+    """
+    if filter_name not in _NVCOMP_FILTER_MAP:
+        return None
+    try:
+        from nvidia import nvcomp as _nv  # noqa: F401
+    except ImportError:
+        return None
+    alg, skip = _NVCOMP_FILTER_MAP[filter_name]
+    from nvidia import nvcomp as _nv
+    codec = _nv.Codec(
+        algorithm=alg,
+        bitstream_kind=_nv.BitstreamKind.RAW,
+        uncomp_chunk_size=uncompressed_nb,
+        cuda_stream=stream_ptr,
+    )
+    return codec, skip
+
+
+def _detect_filters(dataset):
+    """Inspect a dataset's creation property list and return filter information.
+
+    Returns
+    -------
+    has_shuffle : bool
+        Whether the shuffle pre-filter is active.
+    decompress_fn : callable or None
+        ``bytes -> bytes`` function that decompresses one raw chunk.
+        *None* means no compression filter was found.
+    filter_name : str or None
+        Human-readable name of the compression filter, or *None*.
+
+    Raises
+    ------
+    ImportError
+        If a compression filter is present but the required Python package
+        (``lz4``, ``zstd``) is not installed.
+    ValueError
+        If the compression filter code is not recognised.
+    """
+    dcpl = dataset.id.get_create_plist()
+    n = dcpl.get_nfilters()
+    has_shuffle  = False
+    decompress_fn = None
+    filter_name  = None
+
+    for i in range(n):
+        code, _flags, _aux, _name = dcpl.get_filter(i)
+
+        if code == _FILTER_SHUFFLE:
+            has_shuffle = True
+
+        elif code == _FILTER_DEFLATE:
+            decompress_fn = _zlib.decompress
+            filter_name   = "deflate/gzip"
+
+        elif code == _FILTER_LZ4:
+            _lz4_available = False
+            try:
+                import lz4.block as _lz4, struct as _struct
+                _lz4_available = True
+            except ImportError:
+                pass
+
+            if _lz4_available:
+                import lz4.block as _lz4, struct as _struct
+
+                def _lz4_decompress(raw_bytes):
+                    # HDF5 LZ4 plugin header (big-endian):
+                    #   bytes 0-7  : uint64 total uncompressed size
+                    #   bytes 8-11 : uint32 block size (uncompressed per block)
+                    # Then for each block:
+                    #   bytes n..n+3 : uint32 compressed block size
+                    #   bytes n+4..  : block data (LZ4 or raw)
+                    #
+                    # IMPORTANT: when LZ4 cannot compress a block (data is
+                    # incompressible), the HDF5 plugin stores the raw bytes
+                    # directly and sets comp_size == block_size.  We detect
+                    # this and copy the block bytes verbatim.
+                    total_uncomp = _struct.unpack_from(">Q", raw_bytes, 0)[0]
+                    block_size   = _struct.unpack_from(">I", raw_bytes, 8)[0]
+                    offset = 12
+                    out_buf = bytearray()
+                    while offset < len(raw_bytes):
+                        comp_size = _struct.unpack_from(">I", raw_bytes, offset)[0]
+                        offset += 4
+                        block = raw_bytes[offset : offset + comp_size]
+                        if comp_size >= block_size:
+                            # Stored as raw (incompressible)
+                            out_buf.extend(block)
+                        else:
+                            out_buf.extend(_lz4.decompress(bytes(block),
+                                                           uncompressed_size=block_size))
+                        offset += comp_size
+                    return bytes(out_buf[:total_uncomp])
+
+                decompress_fn = _lz4_decompress
+            else:
+                # No CPU lz4 library — decompress_fn stays None.
+                # GPU decompression via nvCOMP is tried in read_chunks_compressed.
+                # If nvCOMP is also absent, the method raises at runtime.
+                decompress_fn = None
+            filter_name = "lz4"
+
+        elif code == _FILTER_ZSTD:
+            try:
+                import zstd as _zstd
+                decompress_fn = _zstd.decompress
+            except ImportError:
+                # No CPU zstd library — GPU path (nvCOMP) will be tried.
+                decompress_fn = None
+            filter_name = "zstd"
+
+        elif code not in (_FILTER_SHUFFLE,):
+            # Unknown filter — not shuffle, not a compression we know about.
+            # Raise so the caller knows it cannot bypass HDF5's pipeline.
+            raise ValueError(
+                f"Unsupported HDF5 filter code {code!r}.  "
+                f"read_chunks_compressed supports deflate/gzip ({_FILTER_DEFLATE}), "
+                f"LZ4 ({_FILTER_LZ4}), and Zstd ({_FILTER_ZSTD})."
+            )
+
+    return has_shuffle, decompress_fn, filter_name
 
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1262,401 @@ class GPUDataset:
         # Drain all streams
         for s in streams:
             s.synchronize()
+
+        return out
+
+    def read_chunks_compressed(self, out=None, stream=None, transform=None):
+        """Read a compressed, chunked HDF5 dataset to the GPU via a
+        decompress-into-pinned-memory pipeline.
+
+        Standard h5py decompresses each chunk into a pageable (ordinary) host
+        buffer and then CUDA must stage through a hidden pinned buffer for the
+        DMA.  This method bypasses that by:
+
+        1. Reading the raw compressed chunk bytes with ``H5Dread_chunk``
+           (no decompression by HDF5 itself).
+        2. Decompressing each chunk directly into a **pinned** (page-locked)
+           host buffer, eliminating the pageable → pinned staging copy.
+        3. Issuing an async ``cudaMemcpyAsync`` (or ``memcpy2DAsync``) from the
+           pinned buffer to the output array on the GPU.
+        4. If the HDF5 *shuffle* pre-filter is present, reversing it on the GPU
+           with a lightweight CUDA kernel — the unshuffle runs on the same
+           stream as the H2D transfer, overlapping with the CPU decompressing
+           the next chunk.
+        5. Applying an optional element-wise *transform* on the same stream
+           after the unshuffle.
+
+        Double-buffering is used so that GPU DMA + unshuffle + transform
+        for chunk *i* overlaps the CPU decompression of chunk *i+1*.
+
+        .. code-block:: text
+
+            iteration i:
+              CPU  ──▶  [decompress chunk_i  → pinned_buf[cur]]   ← already done
+                        [memcpy2DAsync pinned → out[sel_i]]         (non-blocking)
+                        [GPU unshuffle out[sel_i] → gpu_tmp]        (non-blocking)
+                        [cp.copyto(out[sel_i], gpu_tmp_view)]       (non-blocking)
+                        [optional transform(out[sel_i])]            (non-blocking)
+                        [decompress chunk_{i+1} → pinned_buf[nxt]] ← overlaps GPU
+                        [stream.synchronize()]
+
+        Supported compression filters
+        ------------------------------
+        * ``deflate`` / gzip (HDF5 filter code 1) — via Python's built-in
+          :mod:`zlib`.
+        * LZ4 (filter code 32004) — requires ``pip install lz4``.
+        * Zstd (filter code 32015) — requires ``pip install zstd``.
+
+        If the dataset is **not compressed**, the method falls back to
+        :meth:`read_chunks_to_gpu` (which is already optimal for that case).
+
+        Future: GPU decompression
+        -------------------------
+        When `nvCOMP <https://github.com/NVIDIA/nvcomp>`_ is available the
+        pipeline can be extended so that *compressed* bytes are transferred to
+        the GPU (smaller H2D payload) and decompressed entirely on the GPU,
+        eliminating the CPU decompress step.  The current implementation is the
+        correct staging ground for that upgrade.
+
+        Parameters
+        ----------
+        out : cupy.ndarray, optional
+            Pre-allocated C-contiguous output array matching the dataset's
+            shape and dtype.  Allocated automatically if *None*.
+        stream : cupy.cuda.Stream, optional
+            CUDA stream for H2D transfers and GPU kernels.  A new non-blocking
+            stream is created when *None*.
+        transform : callable, optional
+            Element-wise operation applied to each tile on the GPU **after**
+            the unshuffle, on the same stream::
+
+                gpu_ds.read_chunks_compressed(transform=cp.log1p)
+
+        Returns
+        -------
+        cupy.ndarray
+
+        Raises
+        ------
+        ValueError
+            If the dataset is not HDF5-chunked, ``ndim`` is not 2 or 3, or the
+            dataset uses an unsupported filter.
+        ImportError
+            If a third-party decompressor (``lz4``, ``zstd``) is required but
+            not installed.
+        """
+        import cupy as cp  # already checked by _require_cupy in __init__
+
+        dataset = object.__getattribute__(self, "_gpu_dataset")
+
+        if dataset.chunks is None:
+            raise ValueError(
+                "Dataset is not HDF5-chunked. "
+                "Use read_double_buffered() for contiguous datasets."
+            )
+        if dataset.ndim not in (2, 3):
+            raise ValueError(
+                f"read_chunks_compressed supports 2-D and 3-D datasets, "
+                f"got ndim={dataset.ndim}"
+            )
+
+        has_shuffle, decompress_fn, filter_name = _detect_filters(dataset)
+
+        # No compression at all → regular pipelined read is already optimal
+        if decompress_fn is None and filter_name is None:
+            return self.read_chunks_to_gpu(out=out, stream=stream,
+                                           transform=transform)
+
+        shape  = dataset.shape
+        chunks = dataset.chunks
+        dtype  = np.dtype(dataset.dtype)
+
+        if out is None:
+            out = cp.empty(shape, dtype=dtype)
+        else:
+            if not isinstance(out, cp.ndarray):
+                raise TypeError(f"out must be a cupy.ndarray, got {type(out)!r}")
+            if out.shape != shape or out.dtype != dtype:
+                raise ValueError(
+                    f"out shape/dtype {out.shape}/{out.dtype} does not match "
+                    f"dataset {shape}/{dtype}"
+                )
+            if not out.flags["C_CONTIGUOUS"]:
+                raise ValueError("out must be C-contiguous")
+
+        if stream is None:
+            stream = cp.cuda.Stream(non_blocking=True)
+
+        max_elems       = int(np.prod(chunks))
+        uncompressed_nb = max_elems * dtype.itemsize   # bytes per full chunk
+        itemsize        = dtype.itemsize
+        H2D             = cp.cuda.runtime.memcpyHostToDevice
+
+        # ── Choose CPU or GPU decompression ───────────────────────────────────
+        # GPU decompression (nvCOMP) is available for LZ4 and Zstd.
+        # gzip/deflate falls back to CPU (nvCOMP's deflate is a different
+        # algorithm, incompatible with the standard zlib format HDF5 produces).
+        nvcomp_result = _get_nvcomp_decompressor(filter_name, uncompressed_nb,
+                                                  stream.ptr)
+        use_gpu_decomp = nvcomp_result is not None
+
+        # If neither a CPU decompressor nor nvCOMP is available, fail clearly.
+        if not use_gpu_decomp and decompress_fn is None:
+            raise ImportError(
+                f"Cannot decompress '{filter_name}' HDF5 chunks: "
+                f"neither a CPU decompressor nor nvCOMP is available.  "
+                f"Install one of:\n"
+                f"  pip install {'lz4' if filter_name == 'lz4' else 'zstd'}\n"
+                f"  pip install nvidia-nvcomp-cu12  "
+                f"--extra-index-url https://pypi.nvidia.com"
+            )
+
+        if use_gpu_decomp:
+            nvcomp_codec, header_skip = nvcomp_result
+            nvcomp_codec.__enter__()   # activate context manager
+
+            # Find the largest compressed chunk to size the pinned buffers.
+            n_stored = dataset.id.get_num_chunks()
+            max_comp_nb = max(dataset.id.get_chunk_info(i).size
+                              for i in range(n_stored))
+
+            # Two pinned buffers for COMPRESSED bytes (much smaller than
+            # uncompressed_nb for high-compression datasets).
+            pms  = [cp.cuda.alloc_pinned_memory(max_comp_nb) for _ in range(2)]
+            bufs = [np.frombuffer(pm, dtype=np.uint8, count=max_comp_nb)
+                    for pm in pms]
+
+            # One GPU buffer for the compressed payload (reused per chunk).
+            gpu_comp = cp.empty(max_comp_nb, dtype=cp.uint8)
+
+            from nvidia import nvcomp as _nv
+
+            import struct as _struct
+
+            def _read_chunk_into(pinned_buf, chunk_offset):
+                """``read_direct_chunk`` → pinned.
+
+                Returns ``(comp_size, is_raw_block)`` where ``is_raw_block``
+                is ``True`` for LZ4 chunks that the plugin stored as raw
+                bytes because the data was incompressible.
+                """
+                _fmask, raw = dataset.id.read_direct_chunk(chunk_offset)
+                raw_np      = np.frombuffer(raw, dtype=np.uint8)
+                pinned_buf[:len(raw_np)] = raw_np
+                # Detect LZ4 "stored raw" blocks (incompressible data):
+                # the plugin sets block_comp_size == block_size in that case.
+                is_raw_block = False
+                if header_skip == 16 and len(raw_np) >= 16:
+                    block_comp = _struct.unpack_from(">I", raw_np, 12)[0]
+                    block_unc  = _struct.unpack_from(">I", raw_np, 8)[0]
+                    is_raw_block = (block_comp >= block_unc)
+                return len(raw_np), is_raw_block
+
+            def _gpu_decomp_and_place(pinned_buf, comp_size, is_raw_block,
+                                       tile_shape, sel):
+                """H2D compressed/raw bytes → (nvCOMP decode) → unshuffle → place."""
+                payload_nb = comp_size - header_skip
+
+                # 1. H2D payload (skip plugin header)
+                cp.cuda.runtime.memcpyAsync(
+                    gpu_comp.data.ptr,
+                    pinned_buf.ctypes.data + header_skip,
+                    payload_nb,
+                    H2D, stream.ptr,
+                )
+                stream.synchronize()
+
+                if is_raw_block:
+                    # LZ4 "stored raw" block: payload IS the uncompressed data.
+                    decomp_cp   = cp.empty(payload_nb, dtype=cp.uint8)
+                    cp.cuda.runtime.memcpyAsync(
+                        decomp_cp.data.ptr, gpu_comp.data.ptr,
+                        payload_nb,
+                        cp.cuda.runtime.memcpyDeviceToDevice, stream.ptr,
+                    )
+                    _decomp_ref = None
+                else:
+                    # 2. GPU decompress → uint8 GPU array.
+                    # Use a D2D memcpy on `stream` to move nvCOMP's decompressed
+                    # data into a CuPy-owned buffer.  Both decode and the D2D copy
+                    # run on the same non-blocking `stream`, so the copy is
+                    # naturally ordered after the decode without an extra sync.
+                    # We keep `_decomp_ref` alive until after stream.synchronize()
+                    # so that nvCOMP cannot free its buffer while the copy is in
+                    # flight on a non-blocking stream.
+                    comp_arr    = _nv.as_array(gpu_comp[:payload_nb],
+                                               cuda_stream=stream.ptr)
+                    _decomp_ref = nvcomp_codec.decode(comp_arr)
+                    decomp_view = cp.from_dlpack(_decomp_ref)
+                    decomp_cp   = cp.empty(decomp_view.shape, dtype=decomp_view.dtype)
+                    cp.cuda.runtime.memcpyAsync(
+                        decomp_cp.data.ptr, decomp_view.data.ptr,
+                        decomp_view.nbytes,
+                        cp.cuda.runtime.memcpyDeviceToDevice, stream.ptr,
+                    )
+
+                # 3. Unshuffle (if needed) and place in output
+                with stream:
+                    if has_shuffle:
+                        shuffled = decomp_cp.view(cp.uint8)
+                        gpu_full = cp.empty(max_elems, dtype=dtype)
+                        total    = uncompressed_nb
+                        thr      = 256
+                        blk      = (total + thr - 1) // thr
+                        _get_unshuffle_kernel()(
+                            (blk,), (thr,),
+                            (shuffled, gpu_full.view(cp.uint8),
+                             np.int32(max_elems), np.int32(itemsize)),
+                        )
+                        sl = tuple(slice(0, t) for t in tile_shape)
+                        out[sel] = gpu_full.reshape(chunks)[sl]
+                    else:
+                        sl = tuple(slice(0, t) for t in tile_shape)
+                        out[sel] = decomp_cp.view(dtype).reshape(chunks)[sl]
+
+                if transform is not None:
+                    with stream:
+                        out[sel] = transform(out[sel])
+
+                # Synchronise stream so all GPU work (D2D copy + unshuffle) is
+                # complete before _decomp_ref goes out of scope.  Without this,
+                # nvCOMP could free its buffer while the D2D copy is still in
+                # flight on the non-blocking stream (non-blocking streams are NOT
+                # serialised with the null stream, so cp.from_dlpack().copy() on
+                # the null stream would not help either).
+                stream.synchronize()
+                del _decomp_ref  # safe: stream is idle, nvCOMP buffer can be freed
+
+            tiles = list(_iter_tiles(shape, chunks))
+            if not tiles:
+                nvcomp_codec.__exit__(None, None, None)
+                return out
+
+            # Prime: read first chunk into buf[0]
+            first_sel, _  = tiles[0]
+            comp_meta     = [(0, False)] * len(tiles)   # (comp_size, is_raw_block)
+            comp_meta[0]  = _read_chunk_into(
+                bufs[0], tuple(s.start for s in first_sel)
+            )
+
+            try:
+                for i, (sel, tile_shape) in enumerate(tiles):
+                    cur = i % 2
+                    nxt = 1 - cur
+
+                    comp_size, is_raw = comp_meta[i]
+                    # GPU: decompress + unshuffle + transform for tile i
+                    _gpu_decomp_and_place(bufs[cur], comp_size, is_raw,
+                                          tile_shape, sel)
+
+                    # CPU: read next compressed chunk while GPU works
+                    if i + 1 < len(tiles):
+                        next_sel          = tiles[i + 1][0]
+                        next_offset       = tuple(s.start for s in next_sel)
+                        comp_meta[i + 1]  = _read_chunk_into(bufs[nxt], next_offset)
+
+                    stream.synchronize()
+            finally:
+                nvcomp_codec.__exit__(None, None, None)
+            # Release the nvCOMP codec and GPU/pinned buffers explicitly before
+            # returning.  Without this, Python's GC may interleave the destructor
+            # of the nvCOMP Codec with the cleanup of CUDA arrays (CuPy pinned
+            # memory, device arrays), causing an access violation on Windows.
+            del nvcomp_codec, nvcomp_result
+            del gpu_comp, bufs, pms
+
+        else:
+            # ── CPU decompression path ─────────────────────────────────────────
+            # Two pinned host buffers — each holds one FULL decompressed chunk
+            # (padded with fill values for edge tiles).
+            pms  = [cp.cuda.alloc_pinned_memory(uncompressed_nb) for _ in range(2)]
+            bufs = [np.frombuffer(pm, dtype=np.uint8, count=uncompressed_nb)
+                    for pm in pms]
+
+            # GPU scratch for the unshuffle path.
+            gpu_scratch      = cp.empty(uncompressed_nb, dtype=cp.uint8) if has_shuffle else None
+            unshuffle_kernel = _get_unshuffle_kernel() if has_shuffle else None
+            threads          = 256
+
+            def _decompress_into(pinned_buf, chunk_offset):
+                _fmask, raw  = dataset.id.read_direct_chunk(chunk_offset)
+                decompressed  = decompress_fn(raw)
+                pinned_buf[:len(decompressed)] = np.frombuffer(decompressed, dtype=np.uint8)
+
+            def _h2d_and_place(pinned_buf, tile_shape, sel):
+                if has_shuffle:
+                    cp.cuda.runtime.memcpyAsync(
+                        gpu_scratch.data.ptr, pinned_buf.ctypes.data,
+                        uncompressed_nb, H2D, stream.ptr,
+                    )
+                    gpu_full = cp.empty(max_elems, dtype=dtype)
+                    total    = uncompressed_nb
+                    blocks   = (total + threads - 1) // threads
+                    with stream:
+                        unshuffle_kernel(
+                            (blocks,), (threads,),
+                            (gpu_scratch, gpu_full.view(cp.uint8),
+                             np.int32(max_elems), np.int32(itemsize)),
+                        )
+                        sl = tuple(slice(0, t) for t in tile_shape)
+                        out[sel] = gpu_full.reshape(chunks)[sl]
+                else:
+                    if len(tile_shape) == 2:
+                        out_R, out_C   = out.shape
+                        tile_R, tile_C = tile_shape
+                        chunk_C        = chunks[1]
+                        r0, c0         = sel[0].start, sel[1].start
+                        cp.cuda.runtime.memcpy2DAsync(
+                            out.data.ptr + (r0 * out_C + c0) * itemsize,
+                            out_C  * itemsize,
+                            pinned_buf.ctypes.data,
+                            chunk_C * itemsize,
+                            tile_C  * itemsize,
+                            tile_R,
+                            H2D, stream.ptr,
+                        )
+                    else:
+                        _, out_R, out_C          = out.shape
+                        tile_D, tile_R, tile_C   = tile_shape
+                        chunk_D, chunk_R, chunk_C = chunks
+                        d0, r0, c0               = (sel[0].start, sel[1].start,
+                                                    sel[2].start)
+                        src_slice_nb = chunk_R * chunk_C * itemsize
+                        for d in range(tile_D):
+                            cp.cuda.runtime.memcpy2DAsync(
+                                out.data.ptr + (
+                                    (d0 + d) * out_R * out_C + r0 * out_C + c0
+                                ) * itemsize,
+                                out_C  * itemsize,
+                                pinned_buf.ctypes.data + d * src_slice_nb,
+                                chunk_C * itemsize,
+                                tile_C  * itemsize,
+                                tile_R,
+                                H2D, stream.ptr,
+                            )
+
+                if transform is not None:
+                    with stream:
+                        out[sel] = transform(out[sel])
+
+            tiles = list(_iter_tiles(shape, chunks))
+            if not tiles:
+                return out
+
+            first_sel, _ = tiles[0]
+            _decompress_into(bufs[0], tuple(s.start for s in first_sel))
+
+            for i, (sel, tile_shape) in enumerate(tiles):
+                cur = i % 2
+                nxt = 1 - cur
+
+                _h2d_and_place(bufs[cur], tile_shape, sel)
+
+                if i + 1 < len(tiles):
+                    next_sel    = tiles[i + 1][0]
+                    _decompress_into(bufs[nxt], tuple(s.start for s in next_sel))
+
+                stream.synchronize()
 
         return out
 

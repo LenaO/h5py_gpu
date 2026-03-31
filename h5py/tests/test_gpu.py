@@ -19,6 +19,51 @@ cupy = pytest.importorskip("cupy", reason="CuPy not installed — skipping GPU t
 
 from h5py.gpu import GPUDataset, GPUGroup, GPUFile  # noqa: E402
 
+# Optional compression libraries — tests are skipped when absent
+try:
+    import hdf5plugin as _hdf5plugin
+    _HDF5PLUGIN_AVAILABLE = True
+except ImportError:
+    _HDF5PLUGIN_AVAILABLE = False
+
+try:
+    import lz4.block  # noqa: F401
+    _LZ4_AVAILABLE = True
+except ImportError:
+    _LZ4_AVAILABLE = False
+
+try:
+    import zstd  # noqa: F401
+    _ZSTD_AVAILABLE = True
+except ImportError:
+    _ZSTD_AVAILABLE = False
+
+try:
+    from nvidia import nvcomp  # noqa: F401
+    _NVCOMP_AVAILABLE = True
+except ImportError:
+    _NVCOMP_AVAILABLE = False
+
+requires_hdf5plugin = pytest.mark.skipif(
+    not _HDF5PLUGIN_AVAILABLE, reason="hdf5plugin not installed"
+)
+requires_lz4 = pytest.mark.skipif(
+    not (_HDF5PLUGIN_AVAILABLE and _LZ4_AVAILABLE),
+    reason="hdf5plugin or lz4 not installed",
+)
+requires_zstd = pytest.mark.skipif(
+    not (_HDF5PLUGIN_AVAILABLE and _ZSTD_AVAILABLE),
+    reason="hdf5plugin or zstd not installed",
+)
+requires_nvcomp_lz4 = pytest.mark.skipif(
+    not (_HDF5PLUGIN_AVAILABLE and _NVCOMP_AVAILABLE),
+    reason="hdf5plugin or nvidia-nvcomp not installed",
+)
+requires_nvcomp_zstd = pytest.mark.skipif(
+    not (_HDF5PLUGIN_AVAILABLE and _NVCOMP_AVAILABLE),
+    reason="hdf5plugin or nvidia-nvcomp not installed",
+)
+
 
 class TestGPUDataset(TestCase):
     def setUp(self):
@@ -1301,3 +1346,359 @@ class TestGPUCachedDataset(TestCase):
         # .shape and .dtype come from the underlying h5py.Dataset via GPUDataset
         assert cached.shape == (16,)
         assert cached.dtype == np.float32
+
+
+# ---------------------------------------------------------------------------
+# TestReadChunksCompressed
+# ---------------------------------------------------------------------------
+
+class TestReadChunksCompressed(TestCase):
+    """Tests for GPUDataset.read_chunks_compressed.
+
+    Each test creates an HDF5 dataset with a real HDF5 compression filter,
+    then reads it back via read_chunks_compressed and verifies the result
+    matches the original data.
+
+    CPU-decompressor tests (deflate, lz4+lz4lib, zstd+zstdlib) require only
+    the corresponding Python library plus hdf5plugin for the write side.
+
+    GPU-decompressor tests (lz4+nvcomp, zstd+nvcomp) additionally require
+    nvidia-nvcomp.
+    """
+
+    def setUp(self):
+        self.f = h5py.File(self.mktemp(), "w")
+
+    def tearDown(self):
+        if self.f:
+            self.f.close()
+
+    # ------------------------------------------------------------------
+    # Fallback: uncompressed dataset uses read_chunks_to_gpu
+    # ------------------------------------------------------------------
+
+    def test_uncompressed_fallback(self):
+        """read_chunks_compressed on an uncompressed dataset falls back
+        to read_chunks_to_gpu and returns the correct result."""
+        data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16))
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        assert isinstance(result, cupy.ndarray)
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    def test_uncompressed_fallback_3d(self):
+        """3-D uncompressed dataset also falls back correctly."""
+        data = np.arange(8 * 16 * 16, dtype=np.float32).reshape(8, 16, 16)
+        self.f.create_dataset("ds", data=data, chunks=(2, 8, 8))
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    def test_raises_on_unchunked(self):
+        """Contiguous (non-chunked) dataset raises ValueError."""
+        self.f.create_dataset("ds", data=np.zeros((8, 8)))
+        with pytest.raises(ValueError, match="not HDF5-chunked"):
+            GPUDataset(self.f["ds"]).read_chunks_compressed()
+
+    def test_raises_on_1d(self):
+        """1-D chunked dataset raises ValueError (only 2-D and 3-D supported)."""
+        self.f.create_dataset("ds", data=np.zeros(32), chunks=(8,))
+        with pytest.raises(ValueError, match="ndim"):
+            GPUDataset(self.f["ds"]).read_chunks_compressed()
+
+    # ------------------------------------------------------------------
+    # deflate / gzip  (always CPU path — nvCOMP deflate is incompatible)
+    # ------------------------------------------------------------------
+
+    def test_deflate_2d(self):
+        """2-D dataset compressed with gzip/deflate round-trips correctly."""
+        data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16), compression="gzip",
+                              compression_opts=4)
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    def test_deflate_3d(self):
+        """3-D gzip-compressed dataset round-trips correctly."""
+        data = np.random.rand(8, 16, 16).astype(np.float32)
+        self.f.create_dataset("ds", data=data, chunks=(2, 8, 8), compression="gzip")
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), data)
+
+    def test_deflate_with_shuffle(self):
+        """Shuffle + gzip: the GPU unshuffle kernel is applied after decompression."""
+        data = np.arange(64 * 64, dtype=np.float64).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              compression="gzip", shuffle=True)
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    def test_deflate_non_divisible(self):
+        """Edge tiles (dataset dims not multiples of chunk size) are handled."""
+        data = np.arange(50 * 70, dtype=np.int32).reshape(50, 70)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16), compression="gzip")
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    def test_deflate_preallocated_out(self):
+        """Pre-allocated output array is filled correctly."""
+        data = np.arange(32 * 32, dtype=np.float32).reshape(32, 32)
+        self.f.create_dataset("ds", data=data, chunks=(8, 8), compression="gzip")
+        gpu_ds = GPUDataset(self.f["ds"])
+        out = cupy.empty((32, 32), dtype=np.float32)
+        result = gpu_ds.read_chunks_compressed(out=out)
+        assert result is out
+        np.testing.assert_array_equal(cupy.asnumpy(out), data)
+
+    def test_deflate_custom_stream(self):
+        """Caller-supplied CUDA stream is accepted."""
+        data = np.arange(32 * 32, dtype=np.int32).reshape(32, 32)
+        self.f.create_dataset("ds", data=data, chunks=(8, 8), compression="gzip")
+        stream = cupy.cuda.Stream(non_blocking=True)
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed(stream=stream)
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    def test_deflate_transform(self):
+        """transform is applied per-tile on the GPU after decompression."""
+        data = np.arange(1, 64 * 64 + 1, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16), compression="gzip")
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed(
+            transform=lambda x: x * 2.0
+        )
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), data * 2.0)
+
+    def test_deflate_matches_getitem(self):
+        """read_chunks_compressed and gpu_ds[:] return the same data."""
+        data = np.random.rand(64, 32).astype(np.float64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16), compression="gzip")
+        gpu_ds = GPUDataset(self.f["ds"])
+        via_compressed = gpu_ds.read_chunks_compressed()
+        via_getitem    = gpu_ds[:]
+        np.testing.assert_array_almost_equal(
+            cupy.asnumpy(via_compressed), cupy.asnumpy(via_getitem)
+        )
+
+    # ------------------------------------------------------------------
+    # LZ4  (CPU path via `lz4` library)
+    # ------------------------------------------------------------------
+
+    @requires_lz4
+    def test_lz4_cpu_2d(self):
+        """2-D LZ4-compressed dataset decoded on CPU."""
+        data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              **_hdf5plugin.LZ4())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    @requires_lz4
+    def test_lz4_cpu_with_shuffle(self):
+        """Shuffle + LZ4 (CPU decompress + GPU unshuffle)."""
+        data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              shuffle=True, **_hdf5plugin.LZ4())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    @requires_lz4
+    def test_lz4_cpu_3d(self):
+        """3-D LZ4 dataset decoded on CPU."""
+        data = np.random.rand(8, 16, 16).astype(np.float32)
+        self.f.create_dataset("ds", data=data, chunks=(2, 8, 8),
+                              **_hdf5plugin.LZ4())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), data)
+
+    @requires_lz4
+    def test_lz4_cpu_non_divisible(self):
+        """Edge tiles with LZ4 CPU path."""
+        data = np.arange(50 * 70, dtype=np.int32).reshape(50, 70)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              **_hdf5plugin.LZ4())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    @requires_lz4
+    def test_lz4_cpu_transform(self):
+        """transform applied after LZ4 CPU decompression."""
+        data = np.arange(1, 64 * 64 + 1, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              **_hdf5plugin.LZ4())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed(
+            transform=cupy.sqrt
+        )
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), np.sqrt(data))
+
+    # ------------------------------------------------------------------
+    # Zstd  (CPU path via `zstd` library)
+    # ------------------------------------------------------------------
+
+    @requires_zstd
+    def test_zstd_cpu_2d(self):
+        """2-D Zstd-compressed dataset decoded on CPU."""
+        data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              **_hdf5plugin.Zstd())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    @requires_zstd
+    def test_zstd_cpu_with_shuffle(self):
+        """Shuffle + Zstd (CPU decompress + GPU unshuffle)."""
+        data = np.arange(64 * 64, dtype=np.float64).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              shuffle=True, **_hdf5plugin.Zstd())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    @requires_zstd
+    def test_zstd_cpu_3d(self):
+        """3-D Zstd dataset decoded on CPU."""
+        data = np.random.rand(8, 16, 16).astype(np.float32)
+        self.f.create_dataset("ds", data=data, chunks=(2, 8, 8),
+                              **_hdf5plugin.Zstd())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), data)
+
+    @requires_zstd
+    def test_zstd_cpu_transform(self):
+        """transform applied after Zstd CPU decompression."""
+        data = np.arange(1, 64 * 64 + 1, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              **_hdf5plugin.Zstd())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed(
+            transform=lambda x: x + 1.0
+        )
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), data + 1.0)
+
+    # ------------------------------------------------------------------
+    # LZ4  (GPU path via nvCOMP)
+    # ------------------------------------------------------------------
+
+    @requires_nvcomp_lz4
+    def test_lz4_nvcomp_2d(self):
+        """2-D LZ4 dataset decoded on GPU via nvCOMP."""
+        data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              **_hdf5plugin.LZ4())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        assert isinstance(result, cupy.ndarray)
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    @requires_nvcomp_lz4
+    def test_lz4_nvcomp_with_shuffle(self):
+        """Shuffle + LZ4 with nvCOMP GPU decompression + GPU unshuffle."""
+        data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              shuffle=True, **_hdf5plugin.LZ4())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    @requires_nvcomp_lz4
+    def test_lz4_nvcomp_3d(self):
+        """3-D LZ4 dataset decoded on GPU."""
+        data = np.random.rand(8, 16, 16).astype(np.float32)
+        self.f.create_dataset("ds", data=data, chunks=(2, 8, 8),
+                              **_hdf5plugin.LZ4())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), data)
+
+    @requires_nvcomp_lz4
+    def test_lz4_nvcomp_non_divisible(self):
+        """Edge tiles decoded via nvCOMP."""
+        data = np.arange(50 * 70, dtype=np.int32).reshape(50, 70)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              **_hdf5plugin.LZ4())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    @requires_nvcomp_lz4
+    def test_lz4_nvcomp_transform(self):
+        """transform applied after nvCOMP GPU decompression."""
+        data = np.arange(1, 64 * 64 + 1, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              **_hdf5plugin.LZ4())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed(
+            transform=cupy.sqrt
+        )
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), np.sqrt(data))
+
+    @requires_nvcomp_lz4
+    def test_lz4_nvcomp_preallocated_out(self):
+        """Pre-allocated output array filled correctly via nvCOMP path."""
+        data = np.arange(32 * 32, dtype=np.float32).reshape(32, 32)
+        self.f.create_dataset("ds", data=data, chunks=(8, 8),
+                              **_hdf5plugin.LZ4())
+        gpu_ds = GPUDataset(self.f["ds"])
+        out = cupy.empty((32, 32), dtype=np.float32)
+        result = gpu_ds.read_chunks_compressed(out=out)
+        assert result is out
+        np.testing.assert_array_equal(cupy.asnumpy(out), data)
+
+    @requires_nvcomp_lz4
+    def test_lz4_nvcomp_matches_getitem(self):
+        """nvCOMP LZ4 result matches standard h5py read."""
+        data = np.random.rand(64, 32).astype(np.float64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              **_hdf5plugin.LZ4())
+        gpu_ds = GPUDataset(self.f["ds"])
+        via_nvcomp  = gpu_ds.read_chunks_compressed()
+        via_getitem = gpu_ds[:]
+        np.testing.assert_array_almost_equal(
+            cupy.asnumpy(via_nvcomp), cupy.asnumpy(via_getitem)
+        )
+
+    # ------------------------------------------------------------------
+    # Zstd  (GPU path via nvCOMP)
+    # ------------------------------------------------------------------
+
+    @requires_nvcomp_zstd
+    def test_zstd_nvcomp_2d(self):
+        """2-D Zstd dataset decoded on GPU via nvCOMP."""
+        data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              **_hdf5plugin.Zstd())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        assert isinstance(result, cupy.ndarray)
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    @requires_nvcomp_zstd
+    def test_zstd_nvcomp_with_shuffle(self):
+        """Shuffle + Zstd with nvCOMP GPU decompression + GPU unshuffle."""
+        data = np.arange(64 * 64, dtype=np.float64).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              shuffle=True, **_hdf5plugin.Zstd())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_equal(cupy.asnumpy(result), data)
+
+    @requires_nvcomp_zstd
+    def test_zstd_nvcomp_3d(self):
+        """3-D Zstd dataset decoded on GPU."""
+        data = np.random.rand(8, 16, 16).astype(np.float32)
+        self.f.create_dataset("ds", data=data, chunks=(2, 8, 8),
+                              **_hdf5plugin.Zstd())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed()
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), data)
+
+    @requires_nvcomp_zstd
+    def test_zstd_nvcomp_transform(self):
+        """transform applied after nvCOMP Zstd decompression."""
+        data = np.arange(1, 64 * 64 + 1, dtype=np.float32).reshape(64, 64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              **_hdf5plugin.Zstd())
+        result = GPUDataset(self.f["ds"]).read_chunks_compressed(
+            transform=lambda x: x * 2.0
+        )
+        np.testing.assert_array_almost_equal(cupy.asnumpy(result), data * 2.0)
+
+    @requires_nvcomp_zstd
+    def test_zstd_nvcomp_matches_getitem(self):
+        """nvCOMP Zstd result matches standard h5py read."""
+        data = np.random.rand(64, 32).astype(np.float64)
+        self.f.create_dataset("ds", data=data, chunks=(16, 16),
+                              **_hdf5plugin.Zstd())
+        gpu_ds = GPUDataset(self.f["ds"])
+        via_nvcomp  = gpu_ds.read_chunks_compressed()
+        via_getitem = gpu_ds[:]
+        np.testing.assert_array_almost_equal(
+            cupy.asnumpy(via_nvcomp), cupy.asnumpy(via_getitem)
+        )
