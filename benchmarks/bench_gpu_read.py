@@ -406,6 +406,56 @@ def bench_1d_read(f, gpu_ds, data, dtype, hdf5_chunk, repeats, warmup):
 
 
 # ---------------------------------------------------------------------------
+# Section 6: full 2-D chunked read — method comparison
+# ---------------------------------------------------------------------------
+
+def bench_chunked_2d_read(f, gpu_ds, data, dtype, hdf5_chunks, repeats, warmup):
+    """Compare every full 2-D chunked read method at the HDF5 chunk granularity.
+
+    Methods benchmarked
+    -------------------
+    baseline                : GPUDataset[:] — simple pinned read, no pipelining
+    read_double_buffered()  : row-band double-buffering (auto = HDF5-chunk-aligned)
+    read_chunks_to_gpu()    : tile-by-tile double-buffering, one H2D per HDF5 chunk
+    read_selection_chunked(): full-dataset slice; 2-D path uses interior row-bands
+    """
+    rows, cols  = data.shape
+    total_bytes = data.nbytes
+    full_sel    = (slice(0, rows), slice(0, cols))
+
+    print(f"\n  shape={data.shape}  dtype={dtype}  chunks={hdf5_chunks}  "
+          f"size={_gb(total_bytes):.3f} GB")
+
+    methods = [
+        ("baseline (gpu_ds[:])",         lambda: gpu_ds[:]),
+        ("read_double_buffered(auto)",    lambda: gpu_ds.read_double_buffered()),
+        ("read_chunks_to_gpu()",          lambda: gpu_ds.read_chunks_to_gpu()),
+        ("read_selection_chunked(full)",  lambda: gpu_ds.read_selection_chunked(full_sel)),
+    ]
+
+    print(f"\n  {'METHOD':<36} {'TIME (s)':>8}  {'BW (GB/s)':>9}  {'SPEEDUP':>7}")
+    print(f"  {'-'*36}  {'-'*8}  {'-'*9}  {'-'*7}")
+
+    baseline_time = None
+    bw_list = []
+    for label, fn in methods:
+        mean_t, _, _ = _time_fn(fn, repeats, warmup)
+        bw = _gb(total_bytes) / mean_t
+        if baseline_time is None:
+            baseline_time = mean_t
+            sp = "1.00x"
+        else:
+            sp = f"{baseline_time / mean_t:.2f}x"
+        print(f"  {label:<36} {mean_t:8.4f}  {bw:9.3f}  {sp:>7}")
+        bw_list.append((label, bw))
+
+    max_bw = max(bw for _, bw in bw_list)
+    print(f"\n  Bandwidth  (each # ~= {max_bw/28:.2f} GB/s)\n")
+    for label, bw in bw_list:
+        print(f"  {label:<36}  {_bar(bw, max_bw)}  {bw:.3f} GB/s")
+
+
+# ---------------------------------------------------------------------------
 # Top-level runner
 # ---------------------------------------------------------------------------
 
@@ -483,6 +533,13 @@ def run(rows, cols, dtype, hdf5_chunk_rows, hdf5_chunk_cols,
             print(f"  shape=({length},)  chunks=({hdf5_chunk_1d},)")
             bench_1d_read(f, GPUDataset(f["ds_chunked_1d"]), data_1d, dtype,
                           hdf5_chunk=hdf5_chunk_1d, repeats=repeats, warmup=warmup)
+
+            # ── Section 6: 2-D chunked, full read method comparison ────────
+            print(f"\n{'='*72}")
+            print(f"  SECTION 6: 2-D chunked dataset — full read method comparison")
+            print(f"  shape={data_2d.shape}  chunks={hdf5_chunks}")
+            bench_chunked_2d_read(f, GPUDataset(f["ds"]), data_2d, dtype,
+                                  hdf5_chunks, repeats, warmup)
 
     print()
 
