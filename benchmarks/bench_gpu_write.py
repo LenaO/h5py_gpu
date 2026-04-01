@@ -103,7 +103,7 @@ def _bar(value, max_value, width=28):
 def _chunk_sizes(n_rows, ref_chunk):
     """Log-2 sweep of row-band sizes plus ref_chunk."""
     sizes = set()
-    k = 1
+    k = max(1, n_rows>>5)
     while k <= n_rows:
         sizes.add(k)
         k *= 2
@@ -114,7 +114,7 @@ def _chunk_sizes(n_rows, ref_chunk):
 def _chunk_sizes_1d(n, ref_chunk=None):
     """Log-2 sweep of element counts plus optional ref_chunk."""
     sizes = set()
-    k = 1
+    k = n>>10
     while k <= n:
         sizes.add(k)
         k *= 2
@@ -449,6 +449,59 @@ def bench_1d_write(f, ds_name, gpu_ds, data, dtype, hdf5_chunk, repeats, warmup)
 
 
 # ---------------------------------------------------------------------------
+# Section 6: full 2-D chunked write — method comparison
+# ---------------------------------------------------------------------------
+
+def bench_chunked_2d_write(f, gpu_ds, data, dtype, hdf5_chunks, repeats, warmup):
+    """Compare every full 2-D chunked write method at the HDF5 chunk granularity.
+
+    Methods benchmarked
+    -------------------
+    baseline                 : h5py dataset[:] = numpy_array  (CPU -> HDF5)
+    write_double_buffered()  : row-band D2H double-buffering (auto = HDF5-chunk-aligned)
+    write_chunks_from_gpu()  : tile-by-tile D2H, one HDF5 write per chunk
+    write_selection_chunked(): full-dataset slice write (GPU -> pinned -> HDF5)
+    """
+    rows, cols  = data.shape
+    total_bytes = data.nbytes
+    full_sel    = (slice(0, rows), slice(0, cols))
+    gpu_data    = cp.asarray(data)
+    f_ds        = f["ds"]
+
+    print(f"\n  shape={data.shape}  dtype={dtype}  chunks={hdf5_chunks}  "
+          f"size={_gb(total_bytes):.3f} GB")
+
+    methods = [
+        ("baseline (h5py numpy write)",    lambda: f_ds.__setitem__(np.s_[:], data)),
+        ("write_double_buffered(auto)",     lambda: gpu_ds.write_double_buffered(gpu_data)),
+        ("write_chunks_from_gpu()",         lambda: gpu_ds.write_chunks_from_gpu(gpu_data)),
+        ("write_selection_chunked(full)",   lambda: gpu_ds.write_selection_chunked(
+                                                        gpu_data, full_sel)),
+    ]
+
+    print(f"\n  {'METHOD':<36} {'TIME (s)':>8}  {'BW (GB/s)':>9}  {'SPEEDUP':>7}")
+    print(f"  {'-'*36}  {'-'*8}  {'-'*9}  {'-'*7}")
+
+    baseline_time = None
+    bw_list = []
+    for label, fn in methods:
+        mean_t, _, _ = _time_fn(fn, repeats, warmup)
+        bw = _gb(total_bytes) / mean_t
+        if baseline_time is None:
+            baseline_time = mean_t
+            sp = "1.00x"
+        else:
+            sp = f"{baseline_time / mean_t:.2f}x"
+        print(f"  {label:<36} {mean_t:8.4f}  {bw:9.3f}  {sp:>7}")
+        bw_list.append((label, bw))
+
+    max_bw = max(bw for _, bw in bw_list)
+    print(f"\n  Bandwidth  (each # ~= {max_bw/28:.2f} GB/s)\n")
+    for label, bw in bw_list:
+        print(f"  {label:<36}  {_bar(bw, max_bw)}  {bw:.3f} GB/s")
+
+
+# ---------------------------------------------------------------------------
 # Top-level runner
 # ---------------------------------------------------------------------------
 
@@ -534,6 +587,13 @@ def run(rows, cols, dtype, hdf5_chunk_rows, hdf5_chunk_cols,
                            GPUDataset(f["ds_chunked_1d"]),
                            data_1d, dtype,
                            hdf5_chunk=hdf5_chunk_1d, repeats=repeats, warmup=warmup)
+
+            # ── Section 6: 2-D chunked, full write method comparison ───────
+            print(f"\n{'='*72}")
+            print(f"  SECTION 6: 2-D chunked dataset — full write method comparison")
+            print(f"  shape={data_2d.shape}  chunks={hdf5_chunks}")
+            bench_chunked_2d_write(f, GPUDataset(f["ds"]), data_2d, dtype,
+                                   hdf5_chunks, repeats, warmup)
 
     print()
 

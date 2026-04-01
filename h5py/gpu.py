@@ -979,7 +979,7 @@ class GPUDataset:
         return out
 
     def read_double_buffered(self, chunk_size=None, out=None, stream=None,
-                             transform=None):
+                             transform=None, sel=None):
         """Read the entire dataset to the GPU using double-buffered I/O.
 
         Overlaps HDF5 storage reads with host-to-device (H2D) DMA transfers
@@ -1010,26 +1010,43 @@ class GPUDataset:
             reduce Python overhead; smaller values increase overlap
             opportunities.  Defaults to ``dataset.chunks[0]`` for HDF5-chunked
             datasets (aligns reads to chunk boundaries, avoiding partial-chunk
-            decompression), or ``max(1, nrows // 8)`` for contiguous datasets.
+            decompression), or ``max(1, sel_rows // 8)`` for contiguous datasets.
         out : cupy.ndarray, optional
-            Pre-allocated output array with the same shape and dtype as the
-            dataset.  If *None* a new array is allocated.
+            Pre-allocated output array whose shape must match the selected
+            region ``(sel_rows, *row_shape)`` and have the correct dtype.
+            If *None* a new array is allocated.
         stream : cupy.cuda.Stream, optional
             CUDA stream used for async H2D transfers.  If *None* a new
             non-blocking stream is created.
         transform : callable, optional
             Element-wise operation applied to each row-band on the GPU
             **after** its H2D transfer, on the same stream.  Called as
-            ``out[start:end] = transform(out[start:end])`` inside a
+            ``out[os:oe] = transform(out[os:oe])`` inside a
             ``with stream:`` block::
 
                 gpu_ds.read_double_buffered(transform=cp.sqrt)
                 gpu_ds.read_double_buffered(transform=lambda x: x * 2.0)
 
+        sel : slice or tuple[slice, ...], optional
+            Region to read.  *None* reads the entire dataset (default).
+
+            * A plain ``slice`` selects rows along axis 0; all remaining
+              dimensions are read in full::
+
+                  gpu_ds.read_double_buffered(sel=np.s_[512:2048])
+
+            * A tuple of slices selects each dimension independently.  The
+              first slice is always the row axis; subsequent slices clip the
+              remaining dimensions (e.g. columns for a 2-D dataset).  Every
+              slice must have step 1::
+
+                  gpu_ds.read_double_buffered(sel=np.s_[512:2048, 64:192])
+
         Returns
         -------
         cupy.ndarray
-            The full dataset on the current CUDA device.
+            The selected rows on the current CUDA device, shape
+            ``(sel_rows, *row_shape)``.
 
         Raises
         ------
@@ -1047,6 +1064,40 @@ class GPUDataset:
         n_rows = dataset.shape[0]
         row_shape = dataset.shape[1:]
         dtype = np.dtype(dataset.dtype)
+
+        if sel is None:
+            r0, r1      = 0, n_rows
+            extra_slices = ()
+        elif isinstance(sel, slice):
+            r0, r1, step = sel.indices(n_rows)
+            if step != 1:
+                raise ValueError("sel row slice must have step 1")
+            extra_slices = ()
+        elif isinstance(sel, tuple):
+            if not sel or not isinstance(sel[0], slice):
+                raise TypeError("sel tuple must start with a row slice")
+            r0, r1, step = sel[0].indices(n_rows)
+            if step != 1:
+                raise ValueError("sel row slice must have step 1")
+            extra_slices = sel[1:]
+            for i, s in enumerate(extra_slices, start=1):
+                if not isinstance(s, slice):
+                    raise TypeError(f"sel[{i}] must be a slice")
+                if s.indices(dataset.shape[i])[2] != 1:
+                    raise ValueError(f"sel[{i}] must have step 1")
+        else:
+            raise TypeError(
+                "sel must be a slice, a tuple of slices, or None"
+            )
+        sel_rows = r1 - r0
+
+        # Effective row_shape after applying extra_slices to trailing dims
+        if extra_slices:
+            row_shape = tuple(
+                s.indices(n)[1] - s.indices(n)[0]
+                for s, n in zip(extra_slices, dataset.shape[1:])
+            ) + dataset.shape[1 + len(extra_slices):]
+        # (row_shape stays as-is when extra_slices is empty)
         row_nbytes = int(np.prod(row_shape, dtype=np.intp)) * dtype.itemsize
 
         if chunk_size is None:
@@ -1057,22 +1108,23 @@ class GPUDataset:
                 # decompress a chunk and discard part of it.
                 chunk_size = hdf5_chunks[0]
             else:
-                chunk_size = max(1, n_rows // 8)
-        chunk_size = min(chunk_size, n_rows)
+                chunk_size = max(1, sel_rows // 8)
+        chunk_size = min(chunk_size, sel_rows)
 
         if stream is None:
             stream = cp.cuda.Stream(non_blocking=True)
 
-        # Allocate (or validate) output GPU array
+        # Allocate (or validate) output GPU array — shape matches the selection
+        out_shape = (sel_rows,) + row_shape
         if out is None:
-            out = cp.empty(dataset.shape, dtype=dtype)
+            out = cp.empty(out_shape, dtype=dtype)
         else:
             if not isinstance(out, cp.ndarray):
                 raise TypeError(f"out must be a cupy.ndarray, got {type(out)!r}")
-            if out.shape != dataset.shape or out.dtype != dtype:
+            if out.shape != out_shape or out.dtype != dtype:
                 raise ValueError(
                     f"out shape/dtype {out.shape}/{out.dtype} does not match "
-                    f"dataset {dataset.shape}/{dtype}"
+                    f"expected {out_shape}/{dtype}"
                 )
 
         # Two pinned host buffers — each sized for one full chunk
@@ -1082,22 +1134,31 @@ class GPUDataset:
         for k in range(2):
             _pm[k], bufs[k] = _alloc_pinned_like(buf_shape, dtype)
 
-        chunk_starts = list(range(0, n_rows, chunk_size))
+        chunk_starts = list(range(r0, r1, chunk_size))
 
-        # --- Prime the pipeline: fill buf[0] with chunk 0 ---
-        end0 = min(chunk_size, n_rows)
-        dataset.read_direct(bufs[0][:end0], source_sel=np.s_[0:end0])
+        # --- Prime the pipeline: fill buf[0] with the first row-band ---
+        end0 = min(r0 + chunk_size, r1)
+        _nr0 = end0 - r0
+        if extra_slices:
+            _src0  = (slice(r0, end0),) + extra_slices
+            _view0 = bufs[0][:_nr0].reshape((_nr0,) + row_shape)
+        else:
+            _src0  = np.s_[r0:end0]
+            _view0 = bufs[0][:_nr0]
+        dataset.read_direct(_view0, source_sel=_src0)
 
         for i, start in enumerate(chunk_starts):
-            end = min(start + chunk_size, n_rows)
+            end         = min(start + chunk_size, r1)
             actual_rows = end - start
             cur = i % 2
             nxt = 1 - cur
+            os  = start - r0    # offset into output array
+            oe  = os + actual_rows
 
-            # 1. Submit async H2D: cur pinned buf → out[start:end]
+            # 1. Submit async H2D: cur pinned buf → out[os:oe]
             nbytes = actual_rows * row_nbytes
             cp.cuda.runtime.memcpyAsync(
-                out[start:end].data.ptr,
+                out[os:oe].data.ptr,
                 bufs[cur][:actual_rows].ctypes.data,
                 nbytes,
                 cp.cuda.runtime.memcpyHostToDevice,
@@ -1107,17 +1168,20 @@ class GPUDataset:
             # 2. Enqueue optional element-wise transform on the same stream
             if transform is not None:
                 with stream:
-                    out[start:end] = transform(out[start:end])
+                    out[os:oe] = transform(out[os:oe])
 
-            # 3. While H2D + transform run, read the next chunk into the other buffer
+            # 3. While H2D + transform run, read the next row-band into the other buffer
             if i + 1 < len(chunk_starts):
                 next_start = chunk_starts[i + 1]
-                next_end = min(next_start + chunk_size, n_rows)
-                next_rows = next_end - next_start
-                dataset.read_direct(
-                    bufs[nxt][:next_rows],
-                    source_sel=np.s_[next_start:next_end],
-                )
+                next_end   = min(next_start + chunk_size, r1)
+                next_rows  = next_end - next_start
+                if extra_slices:
+                    _src_nxt  = (slice(next_start, next_end),) + extra_slices
+                    _view_nxt = bufs[nxt][:next_rows].reshape((next_rows,) + row_shape)
+                else:
+                    _src_nxt  = np.s_[next_start:next_end]
+                    _view_nxt = bufs[nxt][:next_rows]
+                dataset.read_direct(_view_nxt, source_sel=_src_nxt)
 
             # 4. Wait for H2D (and transform) before cur buffer can be reused
             stream.synchronize()

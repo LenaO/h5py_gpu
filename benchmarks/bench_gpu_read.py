@@ -8,16 +8,17 @@ Usage
                                         [--length N] [--hdf5-chunk-1d N]
                                         [--repeats N] [--warmup N]
 
-Five benchmark sections are run:
+Seven benchmark sections are run:
 
   Section 1 -- Full 2-D chunked dataset read, varying the row-band chunk size
     baseline : GPUDataset[:] -- simple pinned-memory read (no pipelining)
     auto     : GPUDataset.read_double_buffered() -- HDF5-chunk-aligned default
     double   : GPUDataset.read_double_buffered(chunk_size=K)  (log sweep)
 
-  Section 2 -- Selection read on a 2-D chunked dataset
+  Section 2 -- Selection read on a 2-D **chunked** dataset
     baseline : h5py native partial read + simple H2D (no double-buffering)
     chunked  : GPUDataset.read_selection_chunked() -- full-chunk pipeline
+    double   : GPUDataset.read_double_buffered(sel=...) -- row-band double-buffering
 
     Sub-sections:
       (a) Coverage sweep  -- selection covers 10 / 25 / 50 / 75 / 100 % of the dataset,
@@ -29,7 +30,6 @@ Five benchmark sections are run:
       touched   : number of HDF5 chunks read from storage
       waste %   : fraction of read bytes that are discarded after cropping
       BW (GB/s) : useful throughput  (sel_bytes / wall_time)
-      speedup   : baseline_time / chunked_time
 
   Section 3 -- Full 2-D **contiguous** (non-chunked) dataset read
     Same row-band chunk sweep as Section 1 but no HDF5 chunks on disk.
@@ -43,6 +43,17 @@ Five benchmark sections are run:
   Section 5 -- 1-D **chunked** dataset read
     Same as Section 4 but the HDF5 dataset is stored with chunks=(hdf5_chunk_1d,).
     Auto default aligns to the HDF5 chunk boundary.
+
+  Section 6 -- Full 2-D chunked read — method comparison
+    Side-by-side timing of every full 2-D read method.
+
+  Section 7 -- Selection read on a 2-D **contiguous** dataset
+    baseline : _numpy_to_gpu(f_ds[sel]) -- h5py native + simple H2D
+    double   : GPUDataset.read_double_buffered(sel=...) -- row-band pipeline
+
+    Sub-sections mirror Section 2:
+      (a) Coverage sweep  (10 / 25 / 50 / 75 / 100 %, misaligned)
+      (b) Alignment sweep (50 % coverage, aligned vs misaligned)
 """
 
 import argparse
@@ -101,7 +112,7 @@ def _bar(value, max_value, width=28):
 def _chunk_sizes(n_rows, ref_chunk):
     """Log-2 sweep of row-band sizes plus ref_chunk."""
     sizes = set()
-    k = 1
+    k = max(1, n_rows>>5)
     while k <= n_rows:
         sizes.add(k)
         k *= 2
@@ -112,7 +123,7 @@ def _chunk_sizes(n_rows, ref_chunk):
 def _chunk_sizes_1d(n, ref_chunk=None):
     """Log-2 sweep of element counts plus optional ref_chunk."""
     sizes = set()
-    k = 1
+    k = n>>10
     while k <= n:
         sizes.add(k)
         k *= 2
@@ -231,6 +242,10 @@ def _bench_one_sel(f_ds, gpu_ds, sel, dtype, shape, chunks, repeats, warmup):
         lambda: gpu_ds.read_selection_chunked((sel[0], sel[1])), repeats, warmup)
     bw_c = _gb(sel_bytes) / mean_c
 
+    mean_d, _, _ = _time_fn(
+        lambda: gpu_ds.read_double_buffered(sel=(sel[0], sel[1])), repeats, warmup)
+    bw_d = _gb(sel_bytes) / mean_d
+
     return dict(
         sel_mb=_mb(sel_bytes),
         read_mb=_mb(read_bytes),
@@ -238,22 +253,25 @@ def _bench_one_sel(f_ds, gpu_ds, sel, dtype, shape, chunks, repeats, warmup):
         waste_pct=waste_pct,
         mean_b=mean_b, bw_b=bw_b,
         mean_c=mean_c, bw_c=bw_c,
-        speedup=mean_b / mean_c,
+        mean_d=mean_d, bw_d=bw_d,
     )
 
 
 def _print_sel_header():
     print(f"\n  {'SELECTION':<22} {'SEL MB':>6}  {'READ MB':>7}  "
           f"{'CHUNKS':>6}  {'WASTE':>6}  "
-          f"{'BASE BW':>7}  {'CHUNK BW':>8}  {'SPEEDUP':>7}")
+          f"{'BASE BW':>7}  {'CHUNK BW':>8}  {'DBL BW':>7}  {'SP(C)':>6}  {'SP(D)':>6}")
     print(f"  {'-'*22}  {'-'*6}  {'-'*7}  {'-'*6}  {'-'*6}  "
-          f"{'-'*7}  {'-'*8}  {'-'*7}")
+          f"{'-'*7}  {'-'*8}  {'-'*7}  {'-'*6}  {'-'*6}")
 
 
 def _print_sel_row(label, s):
+    sp_c = s['mean_b'] / s['mean_c']
+    sp_d = s['mean_b'] / s['mean_d']
     print(f"  {label:<22}  {s['sel_mb']:>6.1f}  {s['read_mb']:>7.1f}  "
           f"{s['n_chunks']:>6}  {s['waste_pct']:>5.1f}%  "
-          f"{s['bw_b']:>7.3f}  {s['bw_c']:>8.3f}  {s['speedup']:>6.2f}x")
+          f"{s['bw_b']:>7.3f}  {s['bw_c']:>8.3f}  {s['bw_d']:>7.3f}  "
+          f"{sp_c:>5.2f}x  {sp_d:>5.2f}x")
 
 
 def bench_coverage_sweep(f, gpu_ds, data, dtype, chunks, repeats, warmup):
@@ -456,6 +474,87 @@ def bench_chunked_2d_read(f, gpu_ds, data, dtype, hdf5_chunks, repeats, warmup):
 
 
 # ---------------------------------------------------------------------------
+# Section 7: selection read on a 2-D contiguous dataset
+# ---------------------------------------------------------------------------
+
+def _bench_one_sel_contig(f_ds, gpu_ds, sel, dtype, repeats, warmup):
+    """Benchmark one selection on a contiguous dataset.
+
+    Only two methods are possible here — read_selection_chunked requires
+    an HDF5-chunked dataset:
+      baseline : _numpy_to_gpu(f_ds[sel])
+      double   : gpu_ds.read_double_buffered(sel=sel)
+    """
+    r0, r1 = sel[0].start, sel[0].stop
+    c0, c1 = sel[1].start, sel[1].stop
+    sel_bytes = (r1 - r0) * (c1 - c0) * dtype.itemsize
+
+    mean_b, _, _ = _time_fn(
+        lambda: _numpy_to_gpu(f_ds[sel[0], sel[1]]), repeats, warmup)
+    bw_b = _gb(sel_bytes) / mean_b
+
+    mean_d, _, _ = _time_fn(
+        lambda: gpu_ds.read_double_buffered(sel=(sel[0], sel[1])), repeats, warmup)
+    bw_d = _gb(sel_bytes) / mean_d
+
+    return dict(
+        sel_mb=_mb(sel_bytes),
+        mean_b=mean_b, bw_b=bw_b,
+        mean_d=mean_d, bw_d=bw_d,
+    )
+
+
+def _print_sel_contig_header():
+    print(f"\n  {'SELECTION':<26} {'SEL MB':>6}  "
+          f"{'BASE BW':>7}  {'DBL BW':>7}  {'SPEEDUP':>7}")
+    print(f"  {'-'*26}  {'-'*6}  {'-'*7}  {'-'*7}  {'-'*7}")
+
+
+def _print_sel_contig_row(label, s):
+    sp = s['mean_b'] / s['mean_d']
+    print(f"  {label:<26}  {s['sel_mb']:>6.1f}  "
+          f"{s['bw_b']:>7.3f}  {s['bw_d']:>7.3f}  {sp:>6.2f}x")
+
+
+def bench_sel_coverage_contig(f, gpu_ds, data, dtype, repeats, warmup):
+    rows, cols = data.shape
+    # Treat as if the dataset had 16x16 virtual tile alignment for selection
+    # placement — keeps offsets comparable to Section 2's misaligned sweep.
+    tile_r = max(1, rows // 16)
+    tile_c = max(1, cols // 16)
+    coverages = [0.10, 0.25, 0.50, 0.75, 1.00]
+
+    print(f"\n  Coverage sweep — misaligned selections (contiguous, no HDF5 chunks)")
+    _print_sel_contig_header()
+
+    for frac in coverages:
+        r0, r1 = _sel_row(rows, frac, align=False, chunk_rows=tile_r)
+        c0, c1 = _sel_col(cols, frac, align=False, chunk_cols=tile_c)
+        sel = (slice(r0, r1), slice(c0, c1))
+        s = _bench_one_sel_contig(f["ds_contig_2d"], gpu_ds, sel, dtype, repeats, warmup)
+        label = f"{int(frac*100):3d}%  [{r0}:{r1}, {c0}:{c1}]"
+        _print_sel_contig_row(label, s)
+
+
+def bench_sel_alignment_contig(f, gpu_ds, data, dtype, repeats, warmup):
+    rows, cols = data.shape
+    tile_r = max(1, rows // 16)
+    tile_c = max(1, cols // 16)
+    frac = 0.50
+
+    print(f"\n  Alignment sweep — 50% coverage (contiguous, no HDF5 chunks)")
+    _print_sel_contig_header()
+
+    for aligned, label_prefix in [(False, "misaligned"), (True, "aligned  ")]:
+        r0, r1 = _sel_row(rows, frac, align=aligned, chunk_rows=tile_r)
+        c0, c1 = _sel_col(cols, frac, align=aligned, chunk_cols=tile_c)
+        sel = (slice(r0, r1), slice(c0, c1))
+        s = _bench_one_sel_contig(f["ds_contig_2d"], gpu_ds, sel, dtype, repeats, warmup)
+        label = f"{label_prefix} [{r0}:{r1}, {c0}:{c1}]"
+        _print_sel_contig_row(label, s)
+
+
+# ---------------------------------------------------------------------------
 # Top-level runner
 # ---------------------------------------------------------------------------
 
@@ -501,13 +600,15 @@ def run(rows, cols, dtype, hdf5_chunk_rows, hdf5_chunk_cols,
             # ── Section 2: 2-D chunked, selection read ─────────────────────
             print(f"\n{'='*72}")
             print(f"  SECTION 2: 2-D chunked dataset — selection read "
-                  f"(read_selection_chunked)")
+                  f"(read_selection_chunked vs read_double_buffered)")
             print(f"\n  Columns:")
-            print(f"    SEL MB  : bytes of data actually requested (useful payload)")
-            print(f"    READ MB : bytes read from storage (whole chunks, may include waste)")
-            print(f"    WASTE % : fraction of read bytes discarded after crop")
-            print(f"    BASE BW : baseline GB/s  (h5py native + simple H2D)")
-            print(f"    CHUNK BW: read_selection_chunked GB/s (full-chunk pipeline)")
+            print(f"    SEL MB   : bytes of data actually requested (useful payload)")
+            print(f"    READ MB  : bytes read from storage (whole chunks, may include waste)")
+            print(f"    WASTE %  : fraction of read bytes discarded after crop")
+            print(f"    BASE BW  : baseline GB/s  (h5py native + simple H2D)")
+            print(f"    CHUNK BW : read_selection_chunked GB/s (full-chunk pipeline)")
+            print(f"    DBL BW   : read_double_buffered(sel=...) GB/s (row-band pipeline)")
+            print(f"    SP(C)/SP(D): speedup vs baseline for each GPU method")
             bench_coverage_sweep(f, GPUDataset(f["ds"]), data_2d, dtype,
                                  hdf5_chunks, repeats, warmup)
             bench_alignment_sweep(f, GPUDataset(f["ds"]), data_2d, dtype,
@@ -540,6 +641,19 @@ def run(rows, cols, dtype, hdf5_chunk_rows, hdf5_chunk_cols,
             print(f"  shape={data_2d.shape}  chunks={hdf5_chunks}")
             bench_chunked_2d_read(f, GPUDataset(f["ds"]), data_2d, dtype,
                                   hdf5_chunks, repeats, warmup)
+
+            # ── Section 7: 2-D contiguous, selection read ─────────────────
+            print(f"\n{'='*72}")
+            print(f"  SECTION 7: 2-D contiguous dataset — selection read "
+                  f"(read_double_buffered vs baseline)")
+            print(f"  shape={data_2d.shape}  (contiguous)")
+            print(f"\n  Columns:")
+            print(f"    SEL MB  : bytes of data actually requested (useful payload)")
+            print(f"    BASE BW : baseline GB/s  (h5py native + simple H2D)")
+            print(f"    DBL BW  : read_double_buffered(sel=...) GB/s")
+            gpu_ds_contig = GPUDataset(f["ds_contig_2d"])
+            bench_sel_coverage_contig(f, gpu_ds_contig, data_2d, dtype, repeats, warmup)
+            bench_sel_alignment_contig(f, gpu_ds_contig, data_2d, dtype, repeats, warmup)
 
     print()
 
