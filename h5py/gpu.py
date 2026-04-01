@@ -834,48 +834,147 @@ class GPUDataset:
         if stream is None:
             stream = cp.cuda.Stream(non_blocking=True)
 
-        # Two pinned host buffers — each big enough for one full (max) chunk
+        # Two pinned host buffers — each big enough for one full (max) chunk.
+        # Used for edge chunks in the 2D path and for all chunks in 3D.
         max_chunk_elems = int(np.prod(chunks))
         pms  = [cp.cuda.alloc_pinned_memory(max_chunk_elems * dtype.itemsize)
                 for _ in range(2)]
         bufs = [np.frombuffer(pm, dtype=dtype, count=max_chunk_elems) for pm in pms]
 
-        touched = list(_iter_touched_chunks(dataset.shape, chunks, sel))
-        if not touched:
-            return out
-
         def _fill_buf(idx, chunk_file_sel, actual_chunk_shape):
-            """Read the full HDF5 chunk into pinned buffer *idx*."""
+            """Read one HDF5 chunk directly into pinned buffer *idx*."""
             n = int(np.prod(actual_chunk_shape))
             view = np.frombuffer(pms[idx], dtype=dtype, count=n).reshape(actual_chunk_shape)
             dataset.read_direct(view, source_sel=chunk_file_sel)
 
-        # Prime: read first chunk into buf[0]
-        _fill_buf(0, touched[0][0], touched[0][1])
+        if dataset.ndim == 2:
+            # ── 2D optimized path ──────────────────────────────────────────
+            # Classify touched chunks into edge and interior:
+            #
+            #   edge     — partial in ≥1 dimension (top/bottom row, left/right
+            #              col); processed one at a time with _async_h2d_subtile
+            #   interior — fully covered in both dimensions; batched by
+            #              row-band so one read_direct + one memcpy2DAsync
+            #              replaces n_interior_cols individual copies
+            #
+            # Ordering: top edge → bottom edge → left/right edges → interior.
+            # Within each group double-buffering overlaps HDF5 reads with H2D.
 
-        for i, (chunk_file_sel, actual_chunk_shape, local_sel, out_sel) in enumerate(touched):
-            cur = i % 2
-            nxt = 1 - cur
+            r0, r1 = sel[0].start, sel[0].stop
+            c0, c1 = sel[1].start, sel[1].stop
+            R, C   = dataset.shape
+            cr, cc = chunks
 
-            # 1. Async H2D: sub-region of cur chunk → out[out_sel]
-            _async_h2d_subtile(
-                bufs[cur].ctypes.data, actual_chunk_shape,
-                local_sel, out, out_sel, stream,
-            )
+            # Inclusive chunk-index bounds of the touched region
+            ri0 = r0 // cr;  ri1 = (r1 - 1) // cr
+            ci0 = c0 // cc;  ci1 = (c1 - 1) // cc
 
-            # 2. Enqueue optional element-wise transform (ordered after H2D
-            #    on the same stream; runs while CPU reads the next chunk)
-            if transform is not None:
-                with stream:
-                    out[out_sel] = transform(out[out_sel])
+            # Interior chunk-index ranges: fully covered in both dims
+            ri_in0 = ri0 + (1 if r0 % cr else 0)
+            ri_in1 = ri1 - (1 if r1 % cr else 0)
+            ci_in0 = ci0 + (1 if c0 % cc else 0)
+            ci_in1 = ci1 - (1 if c1 % cc else 0)
 
-            # 3. While H2D + transform run, read the next chunk on CPU
-            if i + 1 < len(touched):
-                nxt_file_sel, nxt_shape = touched[i + 1][0], touched[i + 1][1]
-                _fill_buf(nxt, nxt_file_sel, nxt_shape)
+            has_interior = ri_in0 <= ri_in1 and ci_in0 <= ci_in1
 
-            # 4. Wait for H2D (and transform) before reusing cur buffer
-            stream.synchronize()
+            # Edge = not inside the interior chunk-index box
+            edge_chunks = [
+                entry for entry in _iter_touched_chunks(dataset.shape, chunks, sel)
+                if not (ri_in0 <= entry[0][0].start // cr <= ri_in1
+                        and ci_in0 <= entry[0][1].start // cc <= ci_in1)
+            ]
+
+            # ── Phase 1: edge chunks ────────────────────────────────────────
+            if edge_chunks:
+                _fill_buf(0, edge_chunks[0][0], edge_chunks[0][1])
+                for i, (cfs, acs, ls, os) in enumerate(edge_chunks):
+                    cur = i % 2
+                    nxt = 1 - cur
+                    _async_h2d_subtile(bufs[cur].ctypes.data, acs, ls, out, os, stream)
+                    if transform is not None:
+                        with stream:
+                            out[os] = transform(out[os])
+                    if i + 1 < len(edge_chunks):
+                        _fill_buf(nxt, edge_chunks[i + 1][0], edge_chunks[i + 1][1])
+                    stream.synchronize()
+
+            # ── Phase 2: interior row-bands ─────────────────────────────────
+            # The interior col range is fixed across all row-bands, so the
+            # pinned source and the output destination are both contiguous
+            # rectangles — one memcpy2DAsync handles the entire band.
+            if has_interior:
+                c_in_start  = ci_in0 * cc
+                c_in_end    = (ci_in1 + 1) * cc
+                n_in_cols   = c_in_end - c_in_start
+                oc_in_start = c_in_start - c0
+                oc_in_end   = c_in_end   - c0
+
+                # Two double-buffered pinned buffers, one row-band each
+                row_pms  = [cp.cuda.alloc_pinned_memory(cr * n_in_cols * dtype.itemsize)
+                            for _ in range(2)]
+                row_bufs = [np.frombuffer(pm, dtype=dtype, count=cr * n_in_cols)
+                            for pm in row_pms]
+
+                n_row_bands = ri_in1 - ri_in0 + 1
+
+                def _fill_row_band(buf_idx, ri):
+                    r_s  = ri * cr
+                    r_e  = min(r_s + cr, R)
+                    view = np.frombuffer(row_pms[buf_idx], dtype=dtype,
+                                        count=(r_e - r_s) * n_in_cols
+                                        ).reshape(r_e - r_s, n_in_cols)
+                    dataset.read_direct(view, source_sel=(slice(r_s, r_e),
+                                                          slice(c_in_start, c_in_end)))
+                    return r_s, r_e
+
+                # Prime: read first interior row-band into row_bufs[0]
+                _fill_row_band(0, ri_in0)
+
+                for j in range(n_row_bands):
+                    cur  = j % 2
+                    nxt  = 1 - cur
+                    ri   = ri_in0 + j
+                    r_s  = ri * cr
+                    r_e  = min(r_s + cr, R)
+                    nr   = r_e - r_s
+                    or_s = r_s - r0
+                    or_e = r_e - r0
+
+                    # One H2D for the full interior col width of this row-band
+                    _async_h2d_tile(
+                        row_bufs[cur].ctypes.data,
+                        (nr, n_in_cols),
+                        out,
+                        (slice(or_s, or_e), slice(oc_in_start, oc_in_end)),
+                        stream,
+                    )
+                    if transform is not None:
+                        with stream:
+                            out[or_s:or_e, oc_in_start:oc_in_end] = \
+                                transform(out[or_s:or_e, oc_in_start:oc_in_end])
+
+                    if j + 1 < n_row_bands:
+                        _fill_row_band(nxt, ri_in0 + j + 1)
+
+                    stream.synchronize()
+
+        else:
+            # ── 3D: one chunk at a time (existing approach) ────────────────
+            touched = list(_iter_touched_chunks(dataset.shape, chunks, sel))
+            if not touched:
+                return out
+
+            _fill_buf(0, touched[0][0], touched[0][1])
+            for i, (cfs, acs, ls, os) in enumerate(touched):
+                cur = i % 2
+                nxt = 1 - cur
+                _async_h2d_subtile(bufs[cur].ctypes.data, acs, ls, out, os, stream)
+                if transform is not None:
+                    with stream:
+                        out[os] = transform(out[os])
+                if i + 1 < len(touched):
+                    _fill_buf(nxt, touched[i + 1][0], touched[i + 1][1])
+                stream.synchronize()
 
         return out
 
