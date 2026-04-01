@@ -1120,10 +1120,13 @@ class GPUDataset:
         if not tiles:
             return out
 
-        # Prime the pipeline: read first tile into buf[0]
-        first_sel, _ = tiles[0]
-        first_tile = dataset[first_sel]
-        np.copyto(bufs[0][:first_tile.size], first_tile.ravel())
+        # Prime the pipeline: read first tile directly into pinned buf[0]
+        first_sel, first_shape = tiles[0]
+        dataset.read_direct(
+            np.frombuffer(pms[0], dtype=dtype,
+                          count=int(np.prod(first_shape))).reshape(first_shape),
+            source_sel=first_sel,
+        )
 
         for i, (sel, tile_shape) in enumerate(tiles):
             cur = i % 2
@@ -1138,11 +1141,15 @@ class GPUDataset:
                 with stream:
                     out[sel] = transform(out[sel])
 
-            # 3. While H2D + transform run, read the next tile from HDF5 on CPU
+            # 3. While H2D + transform run, read the next tile directly into
+            #    pinned buf[nxt] (no intermediate pageable allocation)
             if i + 1 < len(tiles):
-                next_sel, _ = tiles[i + 1]
-                next_tile = dataset[next_sel]
-                np.copyto(bufs[nxt][:next_tile.size], next_tile.ravel())
+                next_sel, next_shape = tiles[i + 1]
+                dataset.read_direct(
+                    np.frombuffer(pms[nxt], dtype=dtype,
+                                  count=int(np.prod(next_shape))).reshape(next_shape),
+                    source_sel=next_sel,
+                )
 
             # 4. Wait for H2D (and transform) before cur buffer can be reused
             stream.synchronize()
@@ -1247,9 +1254,12 @@ class GPUDataset:
             # iterations ago) before reusing its pinned buffer
             stream.synchronize()
 
-            # Read this tile from HDF5 into the stream's pinned buffer (CPU)
-            tile = dataset[sel]
-            np.copyto(buf[:tile.size], tile.ravel())
+            # Read this tile directly into the stream's pinned buffer (CPU)
+            dataset.read_direct(
+                np.frombuffer(pms[sid], dtype=dtype,
+                              count=int(np.prod(tile_shape))).reshape(tile_shape),
+                source_sel=sel,
+            )
 
             # Submit async H2D on this stream
             _async_h2d_tile(buf.ctypes.data, tile_shape, out, sel, stream)
