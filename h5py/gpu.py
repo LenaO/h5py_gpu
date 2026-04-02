@@ -681,6 +681,77 @@ def _detect_filters(dataset):
 
 
 # ---------------------------------------------------------------------------
+# Per-dataset pinned-memory and stream cache
+# ---------------------------------------------------------------------------
+
+class _PinnedBufferCache:
+    """Reusable pinned host-memory slots and a CUDA stream for one GPUDataset.
+
+    Pinned (page-locked) memory is expensive to allocate and free because it
+    requires a kernel call to pin/unpin the physical pages.  On small datasets
+    or repeated small reads this cost can dominate the actual I/O time.
+
+    This cache avoids the overhead by allocating each slot *once* on first use
+    and only reallocating when a larger buffer is needed (grow-only policy).
+    The lifetime is tied to the owning ``GPUDataset``; CuPy releases the
+    page-locked pages automatically when the ``MemoryPointer`` objects are
+    garbage-collected.
+
+    The single cached CUDA stream is non-blocking and shared across all
+    read/write calls on the same dataset.  This is safe because the methods
+    always call ``stream.synchronize()`` before returning, so consecutive
+    calls on the same dataset are never in flight simultaneously.
+
+    .. warning::
+        Not thread-safe.  Do not use the same ``GPUDataset`` from multiple
+        threads concurrently (h5py itself has the same restriction).
+    """
+
+    __slots__ = ('_slots', '_stream')
+
+    def __init__(self):
+        self._slots  = []   # list of [capacity_bytes, MemoryPointer]
+        self._stream = None
+
+    @property
+    def stream(self):
+        """Non-blocking CUDA stream, created on first access."""
+        if self._stream is None:
+            self._stream = cp.cuda.Stream(non_blocking=True)
+        return self._stream
+
+    def get_bufs(self, count, nbytes):
+        """Return *count* ``MemoryPointer`` objects, each at least *nbytes* large.
+
+        Slots are extended and grown individually on demand.  Callers create
+        ``numpy`` views with the appropriate dtype and shape::
+
+            pms  = cache.get_bufs(2, max_elems * dtype.itemsize)
+            bufs = [np.frombuffer(pms[i], dtype=dtype, count=max_elems)
+                    for i in range(2)]
+
+        Parameters
+        ----------
+        count : int
+            Number of buffer slots required.
+        nbytes : int
+            Minimum capacity of each slot in bytes.
+
+        Returns
+        -------
+        list[cupy.cuda.MemoryPointer]
+        """
+        # Extend slot list as needed
+        while len(self._slots) < count:
+            self._slots.append([0, None])
+        # Grow individual slots whose capacity is too small
+        for i in range(count):
+            if nbytes > self._slots[i][0]:
+                self._slots[i] = [nbytes, cp.cuda.alloc_pinned_memory(nbytes)]
+        return [self._slots[i][1] for i in range(count)]
+
+
+# ---------------------------------------------------------------------------
 # GPUDataset
 # ---------------------------------------------------------------------------
 
@@ -702,8 +773,9 @@ class GPUDataset:
                 f"GPUDataset requires an h5py.Dataset, got {type(dataset)!r}"
             )
         _require_cupy()
-        # Store under a mangled name so __getattr__ does not recurse
+        # Store under mangled names so __getattr__ does not recurse
         object.__setattr__(self, "_gpu_dataset", dataset)
+        object.__setattr__(self, "_gpu_cache", _PinnedBufferCache())
 
     # ------------------------------------------------------------------
     # Core read interface
@@ -831,15 +903,16 @@ class GPUDataset:
             if not out.flags["C_CONTIGUOUS"]:
                 raise ValueError("out must be C-contiguous")
 
+        cache = object.__getattribute__(self, "_gpu_cache")
         if stream is None:
-            stream = cp.cuda.Stream(non_blocking=True)
+            stream = cache.stream
 
         # Two pinned host buffers — each big enough for one full (max) chunk.
         # Used for edge chunks in the 2D path and for all chunks in 3D.
         max_chunk_elems = int(np.prod(chunks))
-        pms  = [cp.cuda.alloc_pinned_memory(max_chunk_elems * dtype.itemsize)
-                for _ in range(2)]
-        bufs = [np.frombuffer(pm, dtype=dtype, count=max_chunk_elems) for pm in pms]
+        pms  = cache.get_bufs(2, max_chunk_elems * dtype.itemsize)
+        bufs = [np.frombuffer(pms[i], dtype=dtype, count=max_chunk_elems)
+                for i in range(2)]
 
         def _fill_buf(idx, chunk_file_sel, actual_chunk_shape):
             """Read one HDF5 chunk directly into pinned buffer *idx*."""
@@ -909,11 +982,14 @@ class GPUDataset:
                 oc_in_start = c_in_start - c0
                 oc_in_end   = c_in_end   - c0
 
-                # Two double-buffered pinned buffers, one row-band each
-                row_pms  = [cp.cuda.alloc_pinned_memory(cr * n_in_cols * dtype.itemsize)
-                            for _ in range(2)]
-                row_bufs = [np.frombuffer(pm, dtype=dtype, count=cr * n_in_cols)
-                            for pm in row_pms]
+                # Two double-buffered pinned buffers, one row-band each.
+                # Reuse the same cache slots as the edge-chunk buffers (the
+                # edge phase is fully synchronised before we get here).
+                row_band_nbytes = cr * n_in_cols * dtype.itemsize
+                row_pms  = cache.get_bufs(2, row_band_nbytes)
+                row_bufs = [np.frombuffer(row_pms[i], dtype=dtype,
+                                          count=cr * n_in_cols)
+                            for i in range(2)]
 
                 n_row_bands = ri_in1 - ri_in0 + 1
 
@@ -1111,8 +1187,9 @@ class GPUDataset:
                 chunk_size = max(1, sel_rows // 8)
         chunk_size = min(chunk_size, sel_rows)
 
+        cache = object.__getattribute__(self, "_gpu_cache")
         if stream is None:
-            stream = cp.cuda.Stream(non_blocking=True)
+            stream = cache.stream
 
         # Allocate (or validate) output GPU array — shape matches the selection
         out_shape = (sel_rows,) + row_shape
@@ -1128,11 +1205,12 @@ class GPUDataset:
                 )
 
         # Two pinned host buffers — each sized for one full chunk
-        buf_shape = (chunk_size,) + row_shape
-        _pm = [None, None]
-        bufs = [None, None]
-        for k in range(2):
-            _pm[k], bufs[k] = _alloc_pinned_like(buf_shape, dtype)
+        buf_shape  = (chunk_size,) + row_shape
+        buf_nbytes = int(np.prod(buf_shape)) * dtype.itemsize
+        pms  = cache.get_bufs(2, buf_nbytes)
+        bufs = [np.frombuffer(pms[k], dtype=dtype,
+                              count=int(np.prod(buf_shape))).reshape(buf_shape)
+                for k in range(2)]
 
         chunk_starts = list(range(r0, r1, chunk_size))
 
@@ -1269,15 +1347,15 @@ class GPUDataset:
             if not out.flags["C_CONTIGUOUS"]:
                 raise ValueError("out must be C-contiguous")
 
+        cache = object.__getattribute__(self, "_gpu_cache")
         if stream is None:
-            stream = cp.cuda.Stream(non_blocking=True)
+            stream = cache.stream
 
         # Two pinned host buffers — each sized for one full (max) chunk.
         # Edge tiles are smaller but always fit.
-        max_elems = int(np.prod(chunks))
-        pms  = [cp.cuda.alloc_pinned_memory(max_elems * dtype.itemsize)
-                for _ in range(2)]
-        bufs = [np.frombuffer(pm, dtype=dtype, count=max_elems) for pm in pms]
+        max_elems  = int(np.prod(chunks))
+        pms  = cache.get_bufs(2, max_elems * dtype.itemsize)
+        bufs = [np.frombuffer(pms[i], dtype=dtype, count=max_elems) for i in range(2)]
 
         tiles = list(_iter_tiles(shape, chunks))
         if not tiles:
@@ -1400,9 +1478,9 @@ class GPUDataset:
 
         # One pinned buffer per stream — each sized for one full (max) chunk
         max_elems = int(np.prod(chunks))
-        pms  = [cp.cuda.alloc_pinned_memory(max_elems * dtype.itemsize)
-                for _ in range(n_streams)]
-        bufs = [np.frombuffer(pm, dtype=dtype, count=max_elems) for pm in pms]
+        cache = object.__getattribute__(self, "_gpu_cache")
+        pms  = cache.get_bufs(n_streams, max_elems * dtype.itemsize)
+        bufs = [np.frombuffer(pms[i], dtype=dtype, count=max_elems) for i in range(n_streams)]
 
         tiles = list(_iter_tiles(shape, chunks))
         if not tiles:
@@ -1557,8 +1635,9 @@ class GPUDataset:
             if not out.flags["C_CONTIGUOUS"]:
                 raise ValueError("out must be C-contiguous")
 
+        cache = object.__getattribute__(self, "_gpu_cache")
         if stream is None:
-            stream = cp.cuda.Stream(non_blocking=True)
+            stream = cache.stream
 
         max_elems       = int(np.prod(chunks))
         uncompressed_nb = max_elems * dtype.itemsize   # bytes per full chunk
@@ -1926,8 +2005,9 @@ class GPUDataset:
         if combine_fn is None:
             combine_fn = reduce_fn
 
+        cache = object.__getattribute__(self, "_gpu_cache")
         if stream is None:
-            stream = cp.cuda.Stream(non_blocking=True)
+            stream = cache.stream
 
         shape  = dataset.shape
         chunks = dataset.chunks
@@ -1944,9 +2024,8 @@ class GPUDataset:
         max_elems = int(np.prod(chunks))
 
         # Two pinned host buffers for double-buffered CPU reads
-        pms  = [cp.cuda.alloc_pinned_memory(max_elems * dtype.itemsize)
-                for _ in range(2)]
-        bufs = [np.frombuffer(pm, dtype=dtype, count=max_elems) for pm in pms]
+        pms  = cache.get_bufs(2, max_elems * dtype.itemsize)
+        bufs = [np.frombuffer(pms[i], dtype=dtype, count=max_elems) for i in range(2)]
 
         # Single reusable GPU temp buffer (safe: always synced before reuse)
         gpu_temp = cp.empty(max_elems, dtype=dtype)
@@ -2041,8 +2120,9 @@ class GPUDataset:
             chunk_size = hdf5_chunks[0] if hdf5_chunks else max(1, n_rows // 8)
         chunk_size = min(chunk_size, n_rows)
 
+        cache = object.__getattribute__(self, "_gpu_cache")
         if stream is None:
-            stream = cp.cuda.Stream(non_blocking=True)
+            stream = cache.stream
 
         chunk_starts = list(range(0, n_rows, chunk_size))
 
@@ -2051,11 +2131,12 @@ class GPUDataset:
         out_dtype = _probe.dtype
 
         # Two pinned host buffers (double-buffered CPU reads)
-        buf_shape = (chunk_size,) + row_shape
-        _pm = [None, None]
-        bufs = [None, None]
-        for k in range(2):
-            _pm[k], bufs[k] = _alloc_pinned_like(buf_shape, dtype)
+        buf_shape  = (chunk_size,) + row_shape
+        buf_nbytes = int(np.prod(buf_shape)) * dtype.itemsize
+        pms  = cache.get_bufs(2, buf_nbytes)
+        bufs = [np.frombuffer(pms[k], dtype=dtype,
+                              count=int(np.prod(buf_shape))).reshape(buf_shape)
+                for k in range(2)]
 
         # Reusable GPU temp buffer (one band at a time)
         gpu_temp = cp.empty(buf_shape, dtype=dtype)
@@ -2187,15 +2268,17 @@ class GPUDataset:
             chunk_size = hdf5_chunks[0] if hdf5_chunks else max(1, n_rows // 8)
         chunk_size = min(chunk_size, n_rows)
 
+        cache = object.__getattribute__(self, "_gpu_cache")
         if stream is None:
-            stream = cp.cuda.Stream(non_blocking=True)
+            stream = cache.stream
 
         # Two pinned host buffers
-        buf_shape = (chunk_size,) + row_shape
-        _pm = [None, None]
-        bufs = [None, None]
-        for k in range(2):
-            _pm[k], bufs[k] = _alloc_pinned_like(buf_shape, dtype)
+        buf_shape  = (chunk_size,) + row_shape
+        buf_nbytes = int(np.prod(buf_shape)) * dtype.itemsize
+        pms  = cache.get_bufs(2, buf_nbytes)
+        bufs = [np.frombuffer(pms[k], dtype=dtype,
+                              count=int(np.prod(buf_shape))).reshape(buf_shape)
+                for k in range(2)]
 
         chunk_starts = list(range(0, n_rows, chunk_size))
 
@@ -2282,13 +2365,13 @@ class GPUDataset:
         if not src.flags["C_CONTIGUOUS"]:
             raise ValueError("src must be C-contiguous")
 
+        cache = object.__getattribute__(self, "_gpu_cache")
         if stream is None:
-            stream = cp.cuda.Stream(non_blocking=True)
+            stream = cache.stream
 
         max_elems = int(np.prod(chunks))
-        pms  = [cp.cuda.alloc_pinned_memory(max_elems * dtype.itemsize)
-                for _ in range(2)]
-        bufs = [np.frombuffer(pm, dtype=dtype, count=max_elems) for pm in pms]
+        pms  = cache.get_bufs(2, max_elems * dtype.itemsize)
+        bufs = [np.frombuffer(pms[i], dtype=dtype, count=max_elems) for i in range(2)]
 
         tiles = list(_iter_tiles(shape, chunks))
         if not tiles:
@@ -2378,13 +2461,13 @@ class GPUDataset:
         if not src.flags["C_CONTIGUOUS"]:
             raise ValueError("src must be C-contiguous")
 
+        cache = object.__getattribute__(self, "_gpu_cache")
         if stream is None:
-            stream = cp.cuda.Stream(non_blocking=True)
+            stream = cache.stream
 
         max_elems = int(np.prod(chunks))
-        pms  = [cp.cuda.alloc_pinned_memory(max_elems * dtype.itemsize)
-                for _ in range(2)]
-        bufs = [np.frombuffer(pm, dtype=dtype, count=max_elems) for pm in pms]
+        pms  = cache.get_bufs(2, max_elems * dtype.itemsize)
+        bufs = [np.frombuffer(pms[i], dtype=dtype, count=max_elems) for i in range(2)]
 
         touched = list(_iter_touched_chunks(dataset.shape, chunks, sel))
         if not touched:
