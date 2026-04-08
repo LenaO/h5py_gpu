@@ -354,6 +354,7 @@ def bench_method_comparison(path, shape, dtype, chunks, repeats, warmup):
 
     with h5py.File(path, "r") as f:
         gpu_ds = GPUDataset(f["ds_2d"])
+        h5_ds  = f["ds_2d"]            # raw h5py dataset for numpy baseline
         arr_gpu = gpu_ds.read_chunks_to_gpu()
         t_comp = _compute_only_time(arr_gpu, _HEAVY_TFM, repeats, warmup)
 
@@ -365,6 +366,7 @@ def bench_method_comparison(path, shape, dtype, chunks, repeats, warmup):
         print(f"  {'-'*36}  {'-'*8}  {'-'*9}  {'-'*7}")
 
         methods_no_tfm = [
+            ("numpy h5py[:] + H2D copy",    lambda: cp.asarray(h5_ds[:])),
             ("baseline (gpu_ds[:])",        lambda: gpu_ds[:]),
             ("read_double_buffered(auto)",   lambda: gpu_ds.read_double_buffered()),
             ("read_chunks_to_gpu()",         lambda: gpu_ds.read_chunks_to_gpu()),
@@ -390,8 +392,10 @@ def bench_method_comparison(path, shape, dtype, chunks, repeats, warmup):
             print(f"  {label:<36}  {_bar(bw, max_bw)}  {bw:.3f} GB/s")
 
         # -- (b) Heavy transform — shows which methods hide compute -----------
+        t_numpy_io, _, _ = _time_fn(lambda: cp.asarray(h5_ds[:]), repeats, warmup)
+        t_seq_numpy = t_numpy_io + t_comp  # standard: h5py read + H2D + sequential compute
         t_base_io, _, _ = _time_fn(lambda: gpu_ds[:], repeats, warmup)
-        t_seq = t_base_io + t_comp  # naive: read then compute sequentially
+        t_seq = t_base_io + t_comp  # GPUDataset[:] + sequential compute
 
         print(f"\n  With transform: {_HEAVY_LABEL}  "
               f"[compute-only: {t_comp:.4f} s]")
@@ -399,10 +403,13 @@ def bench_method_comparison(path, shape, dtype, chunks, repeats, warmup):
               f"{'COMP(s)':>8}  {'OVERLAP':>8}  {'SPEEDUP':>7}")
         print(f"  {'-'*36}  {'-'*8}  {'-'*9}  {'-'*8}  {'-'*8}  {'-'*7}")
 
-        # Baseline row: sequential (no pipeline)
-        bw_seq = _gb(total_bytes) / t_seq
-        print(f"  {'baseline + sequential':<36} {t_seq:8.4f}  {bw_seq:9.3f}  "
+        # Baseline rows: sequential (no pipeline)
+        bw_seq_numpy = _gb(total_bytes) / t_seq_numpy
+        bw_seq       = _gb(total_bytes) / t_seq
+        print(f"  {'numpy h5py[:] + H2D + compute':<36} {t_seq_numpy:8.4f}  {bw_seq_numpy:9.3f}  "
               f"{t_comp:8.4f}  {'   0.0%':>8}  {'1.00x':>7}")
+        print(f"  {'GPUDataset[:] + seq. compute':<36} {t_seq:8.4f}  {bw_seq:9.3f}  "
+              f"{t_comp:8.4f}  {'   0.0%':>8}  {f'{t_seq_numpy/t_seq:.2f}x':>7}")
 
         methods_with_tfm = [
             ("read_double_buffered(auto)",   lambda: gpu_ds.read_double_buffered(
@@ -426,15 +433,16 @@ def bench_method_comparison(path, shape, dtype, chunks, repeats, warmup):
             t, _, _ = _time_fn(fn, repeats, warmup)
             bw = _gb(total_bytes) / t
             overlap = _overlap_pct(t, t_io, t_comp)
-            sp = f"{t_seq / t:.2f}x"
+            sp = f"{t_seq_numpy / t:.2f}x"
             print(f"  {label:<36} {t:8.4f}  {bw:9.3f}  "
                   f"{t_comp:8.4f}  {overlap:>6.1f}%  {sp:>7}")
             bw_list_tfm.append((label, bw))
 
-        all_bws = [bw_seq] + [bw for _, bw in bw_list_tfm]
+        all_bws = [bw_seq_numpy, bw_seq] + [bw for _, bw in bw_list_tfm]
         max_bw = max(all_bws)
         print(f"\n  Bandwidth  (each # ~= {max_bw/28:.2f} GB/s)\n")
-        print(f"  {'baseline + sequential':<36}  {_bar(bw_seq, max_bw)}  {bw_seq:.3f} GB/s")
+        print(f"  {'numpy h5py[:] + H2D + compute':<36}  {_bar(bw_seq_numpy, max_bw)}  {bw_seq_numpy:.3f} GB/s")
+        print(f"  {'GPUDataset[:] + seq. compute':<36}  {_bar(bw_seq, max_bw)}  {bw_seq:.3f} GB/s")
         for label, bw in bw_list_tfm:
             print(f"  {label:<36}  {_bar(bw, max_bw)}  {bw:.3f} GB/s")
 

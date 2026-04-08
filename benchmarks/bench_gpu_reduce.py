@@ -38,11 +38,12 @@ Seven benchmark sections:
 
   Section 6 -- 2-D chunked dataset — method comparison
     Side-by-side comparison of:
-      baseline: load full array (gpu_ds[:]) then reduce sequentially
+      numpy baseline: h5py f["ds"][:] → cp.asarray → reduce  (standard user path)
+      GPUDataset[:] + sequential reduce
       reduce_chunks()
       reduce_double_buffered(auto)
     Two sub-tables: (a) sum (I/O-bound), (b) exp(sqrt(x)) + sum (compute-heavy).
-    Speedup is relative to the sequential baseline.
+    Speedup is relative to the numpy baseline (1.00x).
 
 All sections report:
     TIME(s)   : wall time of the pipelined call
@@ -375,20 +376,23 @@ def bench_1d(path, ds_name, n_elems, dtype, hdf5_chunk, repeats, warmup):
 # ---------------------------------------------------------------------------
 
 def bench_method_comparison(path, shape, dtype, chunks, repeats, warmup):
-    """Compare load-then-reduce vs reduce_chunks vs reduce_double_buffered.
+    """Compare numpy baseline vs reduce_chunks vs reduce_double_buffered.
 
     Two sub-tables:
     (a) sum — I/O-bound, shows raw throughput difference between methods.
     (b) exp(sqrt(x)) + sum — compute-heavy, shows value of pipelining.
 
-    The baseline row in (b) is load (gpu_ds[:]) + sequential compute.
-    Speedup is relative to that sequential baseline.
+    Three baseline rows:
+      numpy h5py[:] + H2D + reduce : standard path (h5py numpy read → cp.asarray → reduce)
+      GPUDataset[:] + seq. reduce  : extension read → sequential reduce (no pipeline)
+    Speedup is relative to the numpy baseline (first row = 1.00x).
     """
     total_bytes = int(np.prod(shape)) * dtype.itemsize
     n_total     = int(np.prod(shape))
 
     with h5py.File(path, "r") as f:
         gpu_ds  = GPUDataset(f["ds_2d"])
+        h5_ds   = f["ds_2d"]           # raw h5py dataset for numpy baseline
         arr_gpu = gpu_ds.read_chunks_to_gpu()
 
         print(f"\n  shape={shape}  dtype={dtype}  chunks={chunks}  "
@@ -400,7 +404,17 @@ def bench_method_comparison(path, shape, dtype, chunks, repeats, warmup):
         ]:
             t_comp = _compute_only_time(arr_gpu, tfm, rfn, repeats, warmup)
 
-            # Baseline: load full array then reduce sequentially
+            # Numpy baseline: standard h5py read → H2D copy → sequential reduce
+            def _numpy_baseline(r=rfn, t=tfm):
+                arr_np  = h5_ds[:]                # standard h5py read (numpy)
+                arr_gpu2 = cp.asarray(arr_np)     # host-to-device copy
+                x = t(arr_gpu2) if t is not None else arr_gpu2
+                return r(x)
+
+            t_numpy, _, _ = _time_fn(_numpy_baseline, repeats, warmup)
+            bw_numpy = _gb(total_bytes) / t_numpy
+
+            # GPUDataset baseline: gpu_ds[:] then reduce sequentially
             t_load, _, _ = _time_fn(lambda: gpu_ds[:], repeats, warmup)
 
             def _seq_baseline(r=rfn, t=tfm):
@@ -419,10 +433,15 @@ def bench_method_comparison(path, shape, dtype, chunks, repeats, warmup):
                   f"{'OVERLAP':>8}  {'SPEEDUP':>7}")
             print(f"  {'-'*36}  {'-'*8}  {'-'*9}  {'-'*8}  {'-'*7}")
 
-            # baseline row
+            # numpy baseline row (reference: 1.00x)
+            overlap_np = "   N/A  " if t_comp == 0 else "   0.0%"
+            print(f"  {'numpy h5py[:] + H2D + reduce':<36} {t_numpy:8.4f}  "
+                  f"{bw_numpy:9.3f}  {overlap_np:>8}  {'1.00x':>7}")
+
+            # GPUDataset sequential baseline row
             overlap_seq = "   N/A  " if t_comp == 0 else "   0.0%"
-            print(f"  {'baseline (load + sequential)':<36} {t_seq:8.4f}  "
-                  f"{bw_seq:9.3f}  {overlap_seq:>8}  {'1.00x':>7}")
+            print(f"  {'GPUDataset[:] + seq. reduce':<36} {t_seq:8.4f}  "
+                  f"{bw_seq:9.3f}  {overlap_seq:>8}  {f'{t_numpy/t_seq:.2f}x':>7}")
 
             methods = [
                 ("reduce_chunks()",
@@ -435,22 +454,24 @@ def bench_method_comparison(path, shape, dtype, chunks, repeats, warmup):
                  lambda: gpu_ds.read_double_buffered()),
             ]
 
-            bw_list = [(sub_label, bw_seq)]
+            bw_list = [(sub_label, bw_numpy), ("GPUDataset seq.", bw_seq)]
             for label, fn, io_fn in methods:
                 t_io_m, _, _ = _time_fn(io_fn, repeats, warmup)
                 t, _, _ = _time_fn(fn, repeats, warmup)
                 bw = _gb(total_bytes) / t
                 overlap = _overlap_pct(t, t_io_m, t_comp)
                 overlap_s = f"{overlap:6.1f}%" if t_comp > 0 else "   N/A  "
-                sp = f"{t_seq / t:.2f}x"
+                sp = f"{t_numpy / t:.2f}x"
                 print(f"  {label:<36} {t:8.4f}  {bw:9.3f}  {overlap_s:>8}  {sp:>7}")
                 bw_list.append((label, bw))
 
             max_bw = max(bw for _, bw in bw_list)
             print(f"\n  Bandwidth  (each # ~= {max_bw/28:.2f} GB/s)\n")
-            print(f"  {'baseline (load + sequential)':<36}  "
+            print(f"  {'numpy h5py[:] + H2D + reduce':<36}  "
+                  f"{_bar(bw_numpy, max_bw)}  {bw_numpy:.3f} GB/s")
+            print(f"  {'GPUDataset[:] + seq. reduce':<36}  "
                   f"{_bar(bw_seq, max_bw)}  {bw_seq:.3f} GB/s")
-            for label, bw in bw_list[1:]:
+            for label, bw in bw_list[2:]:
                 print(f"  {label:<36}  {_bar(bw, max_bw)}  {bw:.3f} GB/s")
 
 
