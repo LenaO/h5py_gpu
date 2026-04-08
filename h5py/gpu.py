@@ -2761,7 +2761,7 @@ class GPUCachedDataset:
         and the old one is freed.  In-place operations (``array *= 2``) avoid
         the extra allocation but must be written as a lambda::
 
-            cached.transform(lambda x: x.__imul__(2.0) or x)
+            cached.transform(lambda x: x.__imul__(2.0))
         """
         self._array = fn(self.array)
         return self

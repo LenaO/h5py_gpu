@@ -345,7 +345,7 @@ def bench_transform_chain(path, shape, dtype, chunks, repeats, warmup):
     total_bytes = int(np.prod(shape)) * dtype.itemsize
 
     transforms = [
-        ("x *= 2  (in-place)",    lambda x: x.__imul__(2.0) or x),
+        ("x *= 2  (in-place)",    lambda x: x.__imul__(2.0)),
         ("sqrt    (out-of-place)", cp.sqrt),
         ("exp     (out-of-place)", cp.exp),
         ("exp(sqrt(x))",           lambda x: cp.exp(cp.sqrt(x))),
