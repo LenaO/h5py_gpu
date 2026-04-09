@@ -178,9 +178,13 @@ def _infer_decomp_path(filter_name):
     return "CPU"
 
 
+_SWEEP_NAMES = {"small_range", "random_i32"}
+
+
 def _chunk_sizes(n_rows, ref_chunk):
+    """Log-2 sweep starting from n_rows//32 to avoid tiny-chunk write overhead."""
     sizes = set()
-    k = 1
+    k = max(1, n_rows >> 5)
     while k <= n_rows:
         sizes.add(k)
         k *= 2
@@ -448,7 +452,7 @@ def run(rows, cols, hdf5_chunk_rows, hdf5_chunk_cols, repeats, warmup, tmp_dir=N
     with tempfile.TemporaryDirectory(dir=tmp_dir) as td:
         path = os.path.join(td, "bench_compressed.h5")
 
-        # Write all datasets (one pass — may take a while for large shapes)
+        # Write all datasets (one pass)
         print(f"\n  Writing datasets ...", end="", flush=True)
         with h5py.File(path, "w") as wf:
             for name, _, data in datasets:
@@ -457,7 +461,8 @@ def run(rows, cols, hdf5_chunk_rows, hdf5_chunk_cols, repeats, warmup, tmp_dir=N
                     _create_lz4_datasets(wf, data, hdf5_chunks, name)
                 if _ZSTD_AVAIL:
                     _create_zstd_datasets(wf, data, hdf5_chunks, name)
-                _create_sweep_datasets(wf, data, hdf5_chunk_rows, name)
+                if name in _SWEEP_NAMES:   # only write sweep data where it's used
+                    _create_sweep_datasets(wf, data, hdf5_chunk_rows, name)
                 print(".", end="", flush=True)
         print(" done.")
 
@@ -496,8 +501,8 @@ def run(rows, cols, hdf5_chunk_rows, hdf5_chunk_cols, repeats, warmup, tmp_dir=N
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--rows",            type=int, default=4096)
-    p.add_argument("--cols",            type=int, default=4096)
+    p.add_argument("--rows",            type=int, default=2048)
+    p.add_argument("--cols",            type=int, default=2048)
     p.add_argument("--hdf5-chunk-rows", type=int, default=None,
                    help="HDF5 chunk rows for 2-D datasets (default: rows // 16)")
     p.add_argument("--hdf5-chunk-cols", type=int, default=None,
