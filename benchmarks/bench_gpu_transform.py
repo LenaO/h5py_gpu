@@ -578,7 +578,7 @@ def bench_1d(path, ds_name, n_elems, dtype, hdf5_chunk, repeats, warmup):
 # ---------------------------------------------------------------------------
 
 def run(rows, cols, dtype, hdf5_chunk_rows, hdf5_chunk_cols,
-        length, hdf5_chunk_1d, repeats, warmup):
+        length, hdf5_chunk_1d, repeats, warmup, tmp_dir=None):
     dtype     = np.dtype(dtype)
     shape_2d  = (rows, cols)
     chunks_2d = (hdf5_chunk_rows, hdf5_chunk_cols)
@@ -598,9 +598,10 @@ def run(rows, cols, dtype, hdf5_chunk_rows, hdf5_chunk_cols,
     print(f"  HDF5 chunk  : {hdf5_chunk_1d} elements  "
           f"({hdf5_chunk_1d * dtype.itemsize / 1024**2:.2f} MB/chunk)")
     print(f"  repeats     : {repeats}   warmup : {warmup}")
+    print(f"  tmp dir     : {tmp_dir or '(system default)' }")
     print(f"{'='*72}")
 
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(dir=tmp_dir) as td:
         path = os.path.join(td, "bench.h5")
         with h5py.File(path, "w") as f:
             f.create_dataset("ds_2d",        data=data_2d, chunks=chunks_2d)
@@ -682,6 +683,10 @@ if __name__ == "__main__":
     p.add_argument("--hdf5-chunk-1d",   type=int, default=None,
                    help="HDF5 chunk size for the 1-D chunked dataset "
                         "(default: length // 16)")
+    p.add_argument("--tmp-dir",          type=str,  default=None,
+                   help="Directory for the temporary HDF5 file "
+                        "(default: system temp). "
+                        "Use to benchmark network or non-default filesystems.")
     p.add_argument("--repeats",         type=int, default=5)
     p.add_argument("--warmup",          type=int, default=2)
     args = p.parse_args()
@@ -694,4 +699,5 @@ if __name__ == "__main__":
     run(args.rows, args.cols, args.dtype,
         hdf5_chunk_rows, hdf5_chunk_cols,
         length, hdf5_chunk_1d,
-        args.repeats, args.warmup)
+        args.repeats, args.warmup,
+        tmp_dir=args.tmp_dir)

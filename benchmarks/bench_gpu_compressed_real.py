@@ -6,9 +6,11 @@ Measures ``GPUDataset.read_chunks_compressed()`` vs the h5py baseline
 from the FPsingle corpus:
   https://userweb.cs.txstate.edu/~burtscher/research/datasets/FPsingle/
 
-Because the internal structure of these datasets is unknown, all HDF5
-datasets are stored as **1-D chunks**.  The dataset length is fixed by the
-file — it cannot be changed from the command line.
+Because the internal structure of these datasets is unknown, the raw 1-D
+float32 array is reshaped into the largest possible **square** 2-D array
+(n × n where n = floor(sqrt(N))).  Any leftover elements are discarded.
+The 2-D shape is required because ``read_chunks_compressed`` only supports
+2-D and 3-D chunked datasets.  HDF5 chunks span full rows: (chunk_rows, n).
 
 Usage
 -----
@@ -18,8 +20,8 @@ Usage
     Optional flags:
       --datasets-dir PATH   directory containing the decompressed .sp files
                             (default: datasets/raw)
-      --hdf5-chunk N        1-D HDF5 chunk size in number of elements
-                            (default: length // 16)
+      --hdf5-chunk N        number of rows per HDF5 chunk (default: n // 16
+                            where n = floor(sqrt(N)))
       --repeats N           timing repetitions (default: 5)
       --warmup  N           warmup iterations   (default: 2)
 
@@ -40,8 +42,8 @@ Three benchmark sections:
     (c) Zstd shuffle sweep: clevel = 3, without vs. with byte-shuffle
 
   Section 3 -- HDF5 chunk-size sweep  (gzip clevel=4, no shuffle)
-    Log-2 sweep of 1-D chunk sizes.  Shows how chunk granularity affects
-    compressed-pipeline throughput for this particular dataset.
+    Log-2 sweep of chunk-row counts (chunk shape = (chunk_rows, n)).
+    Shows how chunk granularity affects compressed-pipeline throughput.
 
 Column definitions
 ------------------
@@ -54,6 +56,7 @@ Column definitions
 """
 
 import argparse
+import math
 import os
 import sys
 import tempfile
@@ -169,11 +172,11 @@ def _infer_decomp_path(filter_name):
     return "CPU"
 
 
-def _chunk_sizes_1d(n, ref_chunk):
-    """Log-2 sweep of 1-D chunk sizes, always including ref_chunk."""
+def _chunk_rows_sweep(n_rows, ref_chunk):
+    """Log-2 sweep of chunk-row counts, always including ref_chunk."""
     sizes = set()
-    k = max(1, n >> 10)
-    while k <= n:
+    k = 1
+    while k <= n_rows:
         sizes.add(k)
         k *= 2
     sizes.add(ref_chunk)
@@ -232,37 +235,37 @@ def _print_barchart(rows, title="RCC BW (GB/s)"):
 # Dataset creation helpers
 # ---------------------------------------------------------------------------
 
-def _create_gzip_datasets(wf, data, chunk):
+def _create_gzip_datasets(wf, data, hdf5_chunks):
     for lvl in (1, 4, 6, 9):
-        wf.create_dataset(f"gzip_lvl{lvl}", data=data, chunks=(chunk,),
+        wf.create_dataset(f"gzip_lvl{lvl}", data=data, chunks=hdf5_chunks,
                           compression="gzip", compression_opts=lvl)
-    wf.create_dataset("gzip4_noshuffle", data=data, chunks=(chunk,),
+    wf.create_dataset("gzip4_noshuffle", data=data, chunks=hdf5_chunks,
                       compression="gzip", compression_opts=4, shuffle=False)
-    wf.create_dataset("gzip4_shuffle", data=data, chunks=(chunk,),
+    wf.create_dataset("gzip4_shuffle", data=data, chunks=hdf5_chunks,
                       compression="gzip", compression_opts=4, shuffle=True)
 
 
-def _create_lz4_datasets(wf, data, chunk):
-    wf.create_dataset("lz4_noshuffle", data=data, chunks=(chunk,),
+def _create_lz4_datasets(wf, data, hdf5_chunks):
+    wf.create_dataset("lz4_noshuffle", data=data, chunks=hdf5_chunks,
                       **_hdf5plugin.LZ4())
-    wf.create_dataset("lz4_shuffle", data=data, chunks=(chunk,),
+    wf.create_dataset("lz4_shuffle", data=data, chunks=hdf5_chunks,
                       shuffle=True, **_hdf5plugin.LZ4())
 
 
-def _create_zstd_datasets(wf, data, chunk):
+def _create_zstd_datasets(wf, data, hdf5_chunks):
     for lvl in (1, 3, 9, 19):
-        wf.create_dataset(f"zstd_lvl{lvl}", data=data, chunks=(chunk,),
+        wf.create_dataset(f"zstd_lvl{lvl}", data=data, chunks=hdf5_chunks,
                           **_hdf5plugin.Zstd(clevel=lvl))
-    wf.create_dataset("zstd3_noshuffle", data=data, chunks=(chunk,),
+    wf.create_dataset("zstd3_noshuffle", data=data, chunks=hdf5_chunks,
                       **_hdf5plugin.Zstd(clevel=3))
-    wf.create_dataset("zstd3_shuffle", data=data, chunks=(chunk,),
+    wf.create_dataset("zstd3_shuffle", data=data, chunks=hdf5_chunks,
                       shuffle=True, **_hdf5plugin.Zstd(clevel=3))
 
 
-def _create_sweep_datasets(wf, data, auto_chunk):
-    n = data.shape[0]
-    for cs in _chunk_sizes_1d(n, auto_chunk):
-        wf.create_dataset(f"sweep_chunk{cs}", data=data, chunks=(cs,),
+def _create_sweep_datasets(wf, data, auto_chunk_rows):
+    n_rows, n_cols = data.shape
+    for cr in _chunk_rows_sweep(n_rows, auto_chunk_rows):
+        wf.create_dataset(f"sweep_chunk{cr}", data=data, chunks=(cr, n_cols),
                           compression="gzip", compression_opts=4)
 
 
@@ -270,12 +273,12 @@ def _create_sweep_datasets(wf, data, auto_chunk):
 # Section 1: gzip / deflate
 # ---------------------------------------------------------------------------
 
-def bench_gzip(rf, data, chunk, repeats, warmup):
+def bench_gzip(rf, data, hdf5_chunks, repeats, warmup):
     uncompressed_bytes = data.nbytes
+    chunk_mb = hdf5_chunks[0] * hdf5_chunks[1] * data.dtype.itemsize / 1024**2
 
-    print(f"\n  n={len(data):,}  dtype={data.dtype}  chunk={chunk:,}  "
-          f"({chunk * data.dtype.itemsize / 1024**2:.2f} MB/chunk)  "
-          f"uncompressed={_mb(uncompressed_bytes):.1f} MB")
+    print(f"\n  shape={data.shape}  dtype={data.dtype}  chunks={hdf5_chunks}  "
+          f"({chunk_mb:.2f} MB/chunk)  uncompressed={_mb(uncompressed_bytes):.1f} MB")
 
     print(f"\n  (a) Compression-level sweep (no shuffle)")
     _print_header()
@@ -356,28 +359,29 @@ def bench_lz4_zstd(rf, data, repeats, warmup):
 # Section 3: chunk-size sweep (gzip-4, 1-D)
 # ---------------------------------------------------------------------------
 
-def bench_chunk_sweep(rf, data, auto_chunk, repeats, warmup):
-    n                  = data.shape[0]
+def bench_chunk_sweep(rf, data, auto_chunk_rows, repeats, warmup):
+    n_rows, n_cols     = data.shape
     uncompressed_bytes = data.nbytes
-    sizes              = _chunk_sizes_1d(n, auto_chunk)
+    sizes              = _chunk_rows_sweep(n_rows, auto_chunk_rows)
 
-    print(f"\n  n={n:,}  dtype={data.dtype}  codec=gzip-4  no shuffle")
+    print(f"\n  shape={data.shape}  dtype={data.dtype}  codec=gzip-4  no shuffle")
     _print_header()
 
     barchart_b = []
     barchart_c = []
-    for cs in sizes:
-        chunk_mb = cs * data.dtype.itemsize / 1024**2
-        m = _bench_one(rf[f"sweep_chunk{cs}"], GPUDataset(rf[f"sweep_chunk{cs}"]),
+    for cr in sizes:
+        chunk_mb = cr * n_cols * data.dtype.itemsize / 1024**2
+        m = _bench_one(rf[f"sweep_chunk{cr}"], GPUDataset(rf[f"sweep_chunk{cr}"]),
                        uncompressed_bytes, repeats, warmup)
-        marker = "*" if cs == auto_chunk else " "
-        label  = f"chunk={cs:,}{marker}"
+        marker = "*" if cr == auto_chunk_rows else " "
+        label  = f"chunk_rows={cr}{marker}"
         _print_row(label, shuffle=False, m=m, decomp_path="CPU")
-        barchart_b.append((f"base  chunk={cs:,}{marker}", m["bw_b"]))
-        barchart_c.append((f"rcc   chunk={cs:,}{marker}", m["bw_c"]))
+        barchart_b.append((f"base  chunk_rows={cr}{marker}", m["bw_b"]))
+        barchart_c.append((f"rcc   chunk_rows={cr}{marker}", m["bw_c"]))
 
-    print(f"\n  * = default chunk ({auto_chunk:,} elements, "
-          f"{auto_chunk * data.dtype.itemsize / 1024**2:.2f} MB)")
+    auto_mb = auto_chunk_rows * n_cols * data.dtype.itemsize / 1024**2
+    print(f"\n  * = default chunk_rows={auto_chunk_rows}  "
+          f"({auto_mb:.2f} MB/chunk  =  ({auto_chunk_rows}, {n_cols}))")
     _print_barchart(barchart_b + barchart_c,
                     title="Section 3 — BASE and RCC BW (GB/s)")
 
@@ -386,28 +390,35 @@ def bench_chunk_sweep(rf, data, auto_chunk, repeats, warmup):
 # Top-level runner
 # ---------------------------------------------------------------------------
 
-def run(data_path, auto_chunk, repeats, warmup):
-    # Load dataset
-    data = np.fromfile(data_path, dtype=np.float32)
-    if data.size == 0:
+def run(data_path, auto_chunk, repeats, warmup, tmp_dir=None):
+    # Load and reshape to largest possible square 2-D array
+    raw = np.fromfile(data_path, dtype=np.float32)
+    if raw.size == 0:
         sys.exit(f"ERROR: {data_path} is empty or could not be read.")
 
+    n         = math.isqrt(raw.size)      # floor(sqrt(N))
+    data      = raw[:n * n].reshape(n, n)
+    discarded = raw.size - n * n
+
     ds_name   = os.path.splitext(os.path.basename(data_path))[0]
-    n_elems   = data.shape[0]
     unc_bytes = data.nbytes
 
+    # Chunk rows (default: n // 16); full-row chunks → (chunk_rows, n)
     if auto_chunk is None:
-        auto_chunk = max(1, n_elems // 16)
+        auto_chunk = max(1, n // 16)
+    hdf5_chunks = (auto_chunk, n)
 
     # Banner
     print(f"\n{'='*74}")
     print(f"  h5py GPU compressed-read benchmark — real dataset")
     print(f"  dataset     : {ds_name}  ({data_path})")
-    print(f"  length      : {n_elems:,} float32 values  "
-          f"({_mb(unc_bytes):.1f} MB uncompressed)")
-    print(f"  HDF5 chunk  : {auto_chunk:,} elements  "
-          f"({auto_chunk * data.dtype.itemsize / 1024**2:.2f} MB/chunk)")
+    print(f"  raw floats  : {raw.size:,}  →  shape ({n}, {n})  "
+          f"({discarded} elements discarded)")
+    print(f"  uncompressed: {_mb(unc_bytes):.1f} MB")
+    print(f"  HDF5 chunks : {hdf5_chunks}  "
+          f"({auto_chunk * n * data.dtype.itemsize / 1024**2:.2f} MB/chunk)")
     print(f"  repeats     : {repeats}   warmup : {warmup}")
+    print(f"  tmp dir     : {tmp_dir or '(system default)' }")
     print(f"  hdf5plugin  : {'yes' if _HDF5PLUGIN else 'NO  (pip install hdf5plugin)'}")
     print(f"  lz4 (CPU)   : {'yes' if _LZ4_CPU   else 'NO  (pip install lz4)'}")
     print(f"  zstd (CPU)  : {'yes' if _ZSTD_CPU  else 'NO  (pip install zstd)'}")
@@ -417,17 +428,17 @@ def run(data_path, auto_chunk, repeats, warmup):
     print(f"  nvCOMP(GPU) : {nvcomp_note}")
     print(f"{'='*74}")
 
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(dir=tmp_dir) as td:
         path = os.path.join(td, "bench_real.h5")
 
         # Write all datasets in a single pass
         print(f"\n  Writing HDF5 datasets from {ds_name} ...", end="", flush=True)
         with h5py.File(path, "w") as wf:
-            _create_gzip_datasets(wf, data, auto_chunk)
+            _create_gzip_datasets(wf, data, hdf5_chunks)
             if _LZ4_AVAIL:
-                _create_lz4_datasets(wf, data, auto_chunk)
+                _create_lz4_datasets(wf, data, hdf5_chunks)
             if _ZSTD_AVAIL:
-                _create_zstd_datasets(wf, data, auto_chunk)
+                _create_zstd_datasets(wf, data, hdf5_chunks)
             _create_sweep_datasets(wf, data, auto_chunk)
         print(" done.")
 
@@ -435,7 +446,7 @@ def run(data_path, auto_chunk, repeats, warmup):
         print(f"\n{'='*74}")
         print(f"  SECTION 1: gzip / deflate  (CPU decompression via zlib)")
         with h5py.File(path, "r") as rf:
-            bench_gzip(rf, data, auto_chunk, repeats, warmup)
+            bench_gzip(rf, data, hdf5_chunks, repeats, warmup)
 
         # Section 2: LZ4 + Zstd
         print(f"\n{'='*74}")
@@ -453,6 +464,7 @@ def run(data_path, auto_chunk, repeats, warmup):
         print(f"  SECTION 3: 1-D chunk-size sweep  (gzip level=4, no shuffle)")
         with h5py.File(path, "r") as rf:
             bench_chunk_sweep(rf, data, auto_chunk, repeats, warmup)
+
 
     print()
 
@@ -507,6 +519,10 @@ if __name__ == "__main__":
                         "(default: datasets/raw)")
     p.add_argument("--hdf5-chunk",   type=int, default=None,
                    help="1-D HDF5 chunk size in elements (default: length // 16)")
+    p.add_argument("--tmp-dir",       type=str,  default=None,
+                   help="Directory for the temporary HDF5 file "
+                        "(default: system temp). "
+                        "Use to benchmark network or non-default filesystems.")
     p.add_argument("--repeats",      type=int, default=5)
     p.add_argument("--warmup",       type=int, default=2)
     p.add_argument("--list",         action="store_true",
@@ -529,4 +545,5 @@ if __name__ == "__main__":
         _list_available(args.datasets_dir)
         sys.exit(1)
 
-    run(data_path, args.hdf5_chunk, args.repeats, args.warmup)
+    run(data_path, args.hdf5_chunk, args.repeats, args.warmup,
+        tmp_dir=args.tmp_dir)

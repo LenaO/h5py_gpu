@@ -418,7 +418,7 @@ def bench_chunk_sweep(rf, datasets, hdf5_chunk_rows, repeats, warmup):
 # Top-level runner
 # ---------------------------------------------------------------------------
 
-def run(rows, cols, hdf5_chunk_rows, hdf5_chunk_cols, repeats, warmup):
+def run(rows, cols, hdf5_chunk_rows, hdf5_chunk_cols, repeats, warmup, tmp_dir=None):
     rng         = np.random.default_rng(42)
     datasets    = _make_datasets(rows, cols, rng)
     hdf5_chunks = (hdf5_chunk_rows, hdf5_chunk_cols)
@@ -432,6 +432,7 @@ def run(rows, cols, hdf5_chunk_rows, hdf5_chunk_cols, repeats, warmup):
     print(f"  HDF5 chunks : {hdf5_chunks}  "
           f"({hdf5_chunk_rows * hdf5_chunk_cols * 4 / 1024**2:.2f} MB/chunk)")
     print(f"  repeats     : {repeats}   warmup : {warmup}")
+    print(f"  tmp dir     : {tmp_dir or '(system default)' }")
     print(f"  hdf5plugin  : {'yes' if _HDF5PLUGIN else 'NO  (pip install hdf5plugin)'}")
     print(f"  lz4 (CPU)   : {'yes' if _LZ4_CPU   else 'NO  (pip install lz4)'}")
     print(f"  zstd (CPU)  : {'yes' if _ZSTD_CPU  else 'NO  (pip install zstd)'}")
@@ -444,7 +445,7 @@ def run(rows, cols, hdf5_chunk_rows, hdf5_chunk_cols, repeats, warmup):
         print(f"    {name:<14}  {desc}")
     print(f"{'='*74}")
 
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(dir=tmp_dir) as td:
         path = os.path.join(td, "bench_compressed.h5")
 
         # Write all datasets (one pass — may take a while for large shapes)
@@ -501,6 +502,10 @@ if __name__ == "__main__":
                    help="HDF5 chunk rows for 2-D datasets (default: rows // 16)")
     p.add_argument("--hdf5-chunk-cols", type=int, default=None,
                    help="HDF5 chunk cols for 2-D datasets (default: cols // 16)")
+    p.add_argument("--tmp-dir",          type=str,  default=None,
+                   help="Directory for the temporary HDF5 file "
+                        "(default: system temp). "
+                        "Use to benchmark network or non-default filesystems.")
     p.add_argument("--repeats",         type=int, default=5)
     p.add_argument("--warmup",          type=int, default=2)
     args = p.parse_args()
@@ -510,4 +515,5 @@ if __name__ == "__main__":
 
     run(args.rows, args.cols,
         hdf5_chunk_rows, hdf5_chunk_cols,
-        args.repeats, args.warmup)
+        args.repeats, args.warmup,
+        tmp_dir=args.tmp_dir)
