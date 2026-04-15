@@ -1055,7 +1055,7 @@ class GPUDataset:
         return out
 
     def read_double_buffered(self, chunk_size=None, out=None, stream=None,
-                             transform=None, sel=None):
+                             transform=None, sel=None, col_align=32):
         """Read the entire dataset to the GPU using double-buffered I/O.
 
         Overlaps HDF5 storage reads with host-to-device (H2D) DMA transfers
@@ -1102,6 +1102,16 @@ class GPUDataset:
 
                 gpu_ds.read_double_buffered(transform=cp.sqrt)
                 gpu_ds.read_double_buffered(transform=lambda x: x * 2.0)
+
+        col_align : int, optional
+            Alignment granularity for column reads on contiguous 2-D datasets,
+            in elements (default 32, i.e. 128 bytes for float32).  When a
+            column slice ``sel[1]`` is present, the column bounds are padded
+            outward to the nearest ``col_align``-element boundary so that each
+            ``pread()`` issued by HDF5 starts at a storage-block-friendly
+            offset.  The padding is stripped during the host-to-device transfer
+            using ``cudaMemcpy2DAsync`` (zero extra CPU copies).  Set to 1 to
+            disable alignment.
 
         sel : slice or tuple[slice, ...], optional
             Region to read.  *None* reads the entire dataset (default).
@@ -1176,6 +1186,46 @@ class GPUDataset:
         # (row_shape stays as-is when extra_slices is empty)
         row_nbytes = int(np.prod(row_shape, dtype=np.intp)) * dtype.itemsize
 
+        # ── Small-data fast path ──────────────────────────────────────────────
+        # For tiny selections the pipeline setup cost (stream, sync, two buffer
+        # allocations) dominates.  A direct HDF5 read + cp.asarray is faster.
+        _FAST_PATH_BYTES = 2 * 1024 * 1024  # 2 MB
+        sel_nbytes = sel_rows * row_nbytes
+        if sel_nbytes < _FAST_PATH_BYTES:
+            if sel is None:
+                raw = dataset[:]
+            elif isinstance(sel, slice):
+                raw = dataset[r0:r1]
+            else:
+                raw = dataset[(slice(r0, r1),) + extra_slices]
+            gpu = cp.asarray(raw)
+            if transform is not None:
+                gpu = transform(gpu)
+            if out is not None:
+                out[:] = gpu
+                return out
+            return gpu
+
+        # ── Column-alignment for 2-D contiguous selections ───────────────────
+        # Pad column bounds outward to col_align-element boundaries so that
+        # each pread() starts at a storage-block-friendly offset.  Alignment
+        # padding is stripped on the fly during H2D with cudaMemcpy2DAsync.
+        _col_aligned         = False
+        _strip_l             = 0           # leading padding elements to discard
+        aligned_extra_slices = extra_slices
+        buf_row_shape        = row_shape   # may widen when alignment is active
+
+        if col_align > 1 and len(extra_slices) == 1 and dataset.ndim == 2:
+            _c0, _c1, _ = extra_slices[0].indices(dataset.shape[1])
+            _c0_al = (_c0 // col_align) * col_align
+            _c1_al = min(dataset.shape[1],
+                         ((_c1 + col_align - 1) // col_align) * col_align)
+            if _c0_al != _c0 or _c1_al != _c1:
+                _col_aligned         = True
+                _strip_l             = _c0 - _c0_al
+                aligned_extra_slices = (slice(_c0_al, _c1_al),)
+                buf_row_shape        = (_c1_al - _c0_al,) + row_shape[1:]
+
         if chunk_size is None:
             hdf5_chunks = dataset.chunks
             if hdf5_chunks is not None:
@@ -1204,8 +1254,11 @@ class GPUDataset:
                     f"expected {out_shape}/{dtype}"
                 )
 
-        # Two pinned host buffers — each sized for one full chunk
-        buf_shape  = (chunk_size,) + row_shape
+        # Two pinned host buffers — each sized for one full chunk.
+        # When column-alignment is active buf_row_shape is slightly wider than
+        # row_shape to accommodate the aligned read; the extra columns are
+        # stripped during H2D by memcpy2DAsync (never written to the output).
+        buf_shape  = (chunk_size,) + buf_row_shape
         buf_nbytes = int(np.prod(buf_shape)) * dtype.itemsize
         pms  = cache.get_bufs(2, buf_nbytes)
         bufs = [np.frombuffer(pms[k], dtype=dtype,
@@ -1217,9 +1270,9 @@ class GPUDataset:
         # --- Prime the pipeline: fill buf[0] with the first row-band ---
         end0 = min(r0 + chunk_size, r1)
         _nr0 = end0 - r0
-        if extra_slices:
-            _src0  = (slice(r0, end0),) + extra_slices
-            _view0 = bufs[0][:_nr0].reshape((_nr0,) + row_shape)
+        if aligned_extra_slices:
+            _src0  = (slice(r0, end0),) + aligned_extra_slices
+            _view0 = bufs[0][:_nr0].reshape((_nr0,) + buf_row_shape)
         else:
             _src0  = np.s_[r0:end0]
             _view0 = bufs[0][:_nr0]
@@ -1234,14 +1287,32 @@ class GPUDataset:
             oe  = os + actual_rows
 
             # 1. Submit async H2D: cur pinned buf → out[os:oe]
-            nbytes = actual_rows * row_nbytes
-            cp.cuda.runtime.memcpyAsync(
-                out[os:oe].data.ptr,
-                bufs[cur][:actual_rows].ctypes.data,
-                nbytes,
-                cp.cuda.runtime.memcpyHostToDevice,
-                stream.ptr,
-            )
+            if _col_aligned:
+                # Strip leading alignment padding with a strided 2D copy.
+                # Source row stride = buf_row_shape[0] elements (aligned width).
+                # Destination row stride = row_shape[0] elements (selected width).
+                _itemsz  = dtype.itemsize
+                _sel_w   = row_shape[0]
+                _aln_w   = buf_row_shape[0]
+                cp.cuda.runtime.memcpy2DAsync(
+                    out[os].data.ptr,                              # dst
+                    _sel_w * _itemsz,                              # dpitch (bytes)
+                    bufs[cur].ctypes.data + _strip_l * _itemsz,   # src (offset past padding)
+                    _aln_w * _itemsz,                              # spitch (bytes)
+                    _sel_w * _itemsz,                              # width  (bytes per row)
+                    actual_rows,                                   # height (rows)
+                    cp.cuda.runtime.memcpyHostToDevice,
+                    stream.ptr,
+                )
+            else:
+                nbytes = actual_rows * row_nbytes
+                cp.cuda.runtime.memcpyAsync(
+                    out[os:oe].data.ptr,
+                    bufs[cur][:actual_rows].ctypes.data,
+                    nbytes,
+                    cp.cuda.runtime.memcpyHostToDevice,
+                    stream.ptr,
+                )
 
             # 2. Enqueue optional element-wise transform on the same stream
             if transform is not None:
@@ -1253,9 +1324,9 @@ class GPUDataset:
                 next_start = chunk_starts[i + 1]
                 next_end   = min(next_start + chunk_size, r1)
                 next_rows  = next_end - next_start
-                if extra_slices:
-                    _src_nxt  = (slice(next_start, next_end),) + extra_slices
-                    _view_nxt = bufs[nxt][:next_rows].reshape((next_rows,) + row_shape)
+                if aligned_extra_slices:
+                    _src_nxt  = (slice(next_start, next_end),) + aligned_extra_slices
+                    _view_nxt = bufs[nxt][:next_rows].reshape((next_rows,) + buf_row_shape)
                 else:
                     _src_nxt  = np.s_[next_start:next_end]
                     _view_nxt = bufs[nxt][:next_rows]
