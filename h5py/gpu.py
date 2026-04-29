@@ -943,6 +943,7 @@ class GPUDataset:
         chunks = dataset.chunks
 
         out, _out_orig = GPUDataset._normalize_out(out)
+        _torch_out = _out_orig is not out  # True only when caller passed a torch.Tensor
         if out is None:
             out = cp.empty(out_shape, dtype=dtype)
         else:
@@ -1093,7 +1094,7 @@ class GPUDataset:
             # ── 3D: one chunk at a time (existing approach) ────────────────
             touched = list(_iter_touched_chunks(dataset.shape, chunks, sel))
             if not touched:
-                return _out_orig if _out_orig is not out else self._to_output(out)
+                return _out_orig if _torch_out else self._to_output(out)
 
             _fill_buf(0, touched[0][0], touched[0][1])
             for i, (cfs, acs, ls, os) in enumerate(touched):
@@ -1107,7 +1108,7 @@ class GPUDataset:
                     _fill_buf(nxt, touched[i + 1][0], touched[i + 1][1])
                 stream.synchronize()
 
-        if _out_orig is not out:   # caller passed a torch tensor
+        if _torch_out:
             return _out_orig
         return self._to_output(out)
 
@@ -1246,6 +1247,7 @@ class GPUDataset:
         # Normalise out early so both the fast path and the main path see the
         # same CuPy-typed buffer and can safely return _out_orig for torch.
         out, _out_orig = GPUDataset._normalize_out(out)
+        _torch_out = _out_orig is not out
 
         # ── Small-data fast path ──────────────────────────────────────────────
         # For tiny selections the pipeline setup cost (stream, sync, two buffer
@@ -1264,7 +1266,7 @@ class GPUDataset:
                 gpu = transform(gpu)
             if out is not None:
                 out[:] = gpu
-                return _out_orig if _out_orig is not out else self._to_output(out)
+                return _out_orig if _torch_out else self._to_output(out)
             return self._to_output(gpu)
 
         # ── Column-alignment for 2-D contiguous selections ───────────────────
@@ -1398,7 +1400,7 @@ class GPUDataset:
             # 4. Wait for H2D (and transform) before cur buffer can be reused
             stream.synchronize()
 
-        if _out_orig is not out:
+        if _torch_out:
             return _out_orig
         return self._to_output(out)
 
@@ -1471,6 +1473,7 @@ class GPUDataset:
         dtype  = np.dtype(dataset.dtype)
 
         out, _out_orig = GPUDataset._normalize_out(out)
+        _torch_out = _out_orig is not out
         if out is None:
             out = cp.empty(shape, dtype=dtype)
         else:
@@ -1498,7 +1501,7 @@ class GPUDataset:
 
         tiles = list(_iter_tiles(shape, chunks))
         if not tiles:
-            return _out_orig if _out_orig is not out else self._to_output(out)
+            return _out_orig if _torch_out else self._to_output(out)
 
         # Prime the pipeline: read first tile directly into pinned buf[0]
         first_sel, first_shape = tiles[0]
@@ -1534,7 +1537,7 @@ class GPUDataset:
             # 4. Wait for H2D (and transform) before cur buffer can be reused
             stream.synchronize()
 
-        if _out_orig is not out:
+        if _torch_out:
             return _out_orig
         return self._to_output(out)
 
@@ -1602,6 +1605,7 @@ class GPUDataset:
         dtype  = np.dtype(dataset.dtype)
 
         out, _out_orig = GPUDataset._normalize_out(out)
+        _torch_out = _out_orig is not out
         if out is None:
             out = cp.empty(shape, dtype=dtype)
         else:
@@ -1628,7 +1632,7 @@ class GPUDataset:
 
         tiles = list(_iter_tiles(shape, chunks))
         if not tiles:
-            return _out_orig if _out_orig is not out else self._to_output(out)
+            return _out_orig if _torch_out else self._to_output(out)
 
         for i, (sel, tile_shape) in enumerate(tiles):
             sid    = i % n_streams
@@ -1658,7 +1662,7 @@ class GPUDataset:
         for s in streams:
             s.synchronize()
 
-        if _out_orig is not out:
+        if _torch_out:
             return _out_orig
         return self._to_output(out)
 
