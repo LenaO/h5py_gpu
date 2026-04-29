@@ -59,6 +59,13 @@ try:
 except ImportError:
     _CUPY_AVAILABLE = False
 
+try:
+    import torch as _torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _torch = None
+    _TORCH_AVAILABLE = False
+
 # HDF5 filter codes
 _FILTER_DEFLATE  = 1      # gzip / zlib
 _FILTER_SHUFFLE  = 2      # byte-shuffle pre-filter
@@ -79,6 +86,14 @@ def _require_cupy():
             "CuPy is required for GPU support but could not be imported. "
             "Install it with: pip install cupy-cuda12x  "
             "(adjust the CUDA suffix to match your toolkit version)"
+        )
+
+
+def _require_torch():
+    if not _TORCH_AVAILABLE:
+        raise ImportError(
+            "PyTorch is required for backend='torch' but could not be imported. "
+            "Install it with: pip install torch"
         )
 
 
@@ -767,15 +782,52 @@ class GPUDataset:
         An open h5py dataset.
     """
 
-    def __init__(self, dataset):
+    def __init__(self, dataset, backend="cupy"):
         if not isinstance(dataset, Dataset):
             raise TypeError(
                 f"GPUDataset requires an h5py.Dataset, got {type(dataset)!r}"
             )
+        if backend not in ("cupy", "torch"):
+            raise ValueError(f"backend must be 'cupy' or 'torch', got {backend!r}")
         _require_cupy()
+        if backend == "torch":
+            _require_torch()
         # Store under mangled names so __getattr__ does not recurse
         object.__setattr__(self, "_gpu_dataset", dataset)
         object.__setattr__(self, "_gpu_cache", _PinnedBufferCache())
+        object.__setattr__(self, "_gpu_backend", backend)
+
+    # ------------------------------------------------------------------
+    # Backend helpers
+    # ------------------------------------------------------------------
+
+    def _to_output(self, arr):
+        """Wrap a CuPy ndarray as the configured backend type.
+
+        For ``backend='cupy'`` this is a no-op.  For ``backend='torch'`` the
+        array is wrapped as a :class:`torch.Tensor` via DLPack — zero-copy,
+        the underlying CUDA buffer is shared.
+        """
+        if object.__getattribute__(self, "_gpu_backend") == "torch":
+            return _torch.from_dlpack(arr)
+        return arr
+
+    @staticmethod
+    def _normalize_out(out):
+        """Coerce a user-supplied *out* buffer to a CuPy ndarray.
+
+        If *out* is a CUDA :class:`torch.Tensor`, returns a zero-copy CuPy
+        view via ``__cuda_array_interface__`` and the original tensor so it
+        can be returned to the caller unchanged.  Otherwise returns
+        ``(out, out)``.
+
+        Returns
+        -------
+        (cp_out, original)
+        """
+        if _TORCH_AVAILABLE and isinstance(out, _torch.Tensor):
+            return cp.asarray(out), out   # zero-copy; shares the CUDA buffer
+        return out, out
 
     # ------------------------------------------------------------------
     # Core read interface
@@ -810,7 +862,7 @@ class GPUDataset:
         arr = dataset[args]
         if not isinstance(arr, np.ndarray):
             return arr
-        return _numpy_to_gpu(arr)
+        return self._to_output(_numpy_to_gpu(arr))
 
     def read_selection_chunked(self, sel, out=None, stream=None, transform=None):
         """Read a slice selection from a chunked dataset to the GPU,
@@ -890,11 +942,14 @@ class GPUDataset:
         dtype  = np.dtype(dataset.dtype)
         chunks = dataset.chunks
 
+        out, _out_orig = GPUDataset._normalize_out(out)
         if out is None:
             out = cp.empty(out_shape, dtype=dtype)
         else:
             if not isinstance(out, cp.ndarray):
-                raise TypeError(f"out must be a cupy.ndarray, got {type(out)!r}")
+                raise TypeError(
+                    f"out must be a cupy.ndarray or CUDA torch.Tensor, got {type(out)!r}"
+                )
             if out.shape != out_shape or out.dtype != dtype:
                 raise ValueError(
                     f"out shape/dtype {out.shape}/{out.dtype} does not match "
@@ -1038,7 +1093,7 @@ class GPUDataset:
             # ── 3D: one chunk at a time (existing approach) ────────────────
             touched = list(_iter_touched_chunks(dataset.shape, chunks, sel))
             if not touched:
-                return out
+                return _out_orig if _out_orig is not out else self._to_output(out)
 
             _fill_buf(0, touched[0][0], touched[0][1])
             for i, (cfs, acs, ls, os) in enumerate(touched):
@@ -1052,7 +1107,9 @@ class GPUDataset:
                     _fill_buf(nxt, touched[i + 1][0], touched[i + 1][1])
                 stream.synchronize()
 
-        return out
+        if _out_orig is not out:   # caller passed a torch tensor
+            return _out_orig
+        return self._to_output(out)
 
     def read_double_buffered(self, chunk_size=None, out=None, stream=None,
                              transform=None, sel=None, col_align=32):
@@ -1186,6 +1243,10 @@ class GPUDataset:
         # (row_shape stays as-is when extra_slices is empty)
         row_nbytes = int(np.prod(row_shape, dtype=np.intp)) * dtype.itemsize
 
+        # Normalise out early so both the fast path and the main path see the
+        # same CuPy-typed buffer and can safely return _out_orig for torch.
+        out, _out_orig = GPUDataset._normalize_out(out)
+
         # ── Small-data fast path ──────────────────────────────────────────────
         # For tiny selections the pipeline setup cost (stream, sync, two buffer
         # allocations) dominates.  A direct HDF5 read + cp.asarray is faster.
@@ -1203,8 +1264,8 @@ class GPUDataset:
                 gpu = transform(gpu)
             if out is not None:
                 out[:] = gpu
-                return out
-            return gpu
+                return _out_orig if _out_orig is not out else self._to_output(out)
+            return self._to_output(gpu)
 
         # ── Column-alignment for 2-D contiguous selections ───────────────────
         # Pad column bounds outward to col_align-element boundaries so that
@@ -1247,7 +1308,9 @@ class GPUDataset:
             out = cp.empty(out_shape, dtype=dtype)
         else:
             if not isinstance(out, cp.ndarray):
-                raise TypeError(f"out must be a cupy.ndarray, got {type(out)!r}")
+                raise TypeError(
+                    f"out must be a cupy.ndarray or CUDA torch.Tensor, got {type(out)!r}"
+                )
             if out.shape != out_shape or out.dtype != dtype:
                 raise ValueError(
                     f"out shape/dtype {out.shape}/{out.dtype} does not match "
@@ -1335,7 +1398,9 @@ class GPUDataset:
             # 4. Wait for H2D (and transform) before cur buffer can be reused
             stream.synchronize()
 
-        return out
+        if _out_orig is not out:
+            return _out_orig
+        return self._to_output(out)
 
     def read_chunks_to_gpu(self, out=None, stream=None, transform=None):
         """Read a chunked HDF5 dataset to the GPU one tile at a time,
@@ -1405,11 +1470,14 @@ class GPUDataset:
         chunks = dataset.chunks
         dtype  = np.dtype(dataset.dtype)
 
+        out, _out_orig = GPUDataset._normalize_out(out)
         if out is None:
             out = cp.empty(shape, dtype=dtype)
         else:
             if not isinstance(out, cp.ndarray):
-                raise TypeError(f"out must be a cupy.ndarray, got {type(out)!r}")
+                raise TypeError(
+                    f"out must be a cupy.ndarray or CUDA torch.Tensor, got {type(out)!r}"
+                )
             if out.shape != shape or out.dtype != dtype:
                 raise ValueError(
                     f"out shape/dtype {out.shape}/{out.dtype} does not match "
@@ -1430,7 +1498,7 @@ class GPUDataset:
 
         tiles = list(_iter_tiles(shape, chunks))
         if not tiles:
-            return out
+            return _out_orig if _out_orig is not out else self._to_output(out)
 
         # Prime the pipeline: read first tile directly into pinned buf[0]
         first_sel, first_shape = tiles[0]
@@ -1466,7 +1534,9 @@ class GPUDataset:
             # 4. Wait for H2D (and transform) before cur buffer can be reused
             stream.synchronize()
 
-        return out
+        if _out_orig is not out:
+            return _out_orig
+        return self._to_output(out)
 
     def read_chunks_parallel(self, out=None, n_streams=2, transform=None):
         """Read a chunked HDF5 dataset to the GPU using multiple CUDA streams.
@@ -1531,11 +1601,14 @@ class GPUDataset:
         chunks = dataset.chunks
         dtype  = np.dtype(dataset.dtype)
 
+        out, _out_orig = GPUDataset._normalize_out(out)
         if out is None:
             out = cp.empty(shape, dtype=dtype)
         else:
             if not isinstance(out, cp.ndarray):
-                raise TypeError(f"out must be a cupy.ndarray, got {type(out)!r}")
+                raise TypeError(
+                    f"out must be a cupy.ndarray or CUDA torch.Tensor, got {type(out)!r}"
+                )
             if out.shape != shape or out.dtype != dtype:
                 raise ValueError(
                     f"out shape/dtype {out.shape}/{out.dtype} does not match "
@@ -1555,7 +1628,7 @@ class GPUDataset:
 
         tiles = list(_iter_tiles(shape, chunks))
         if not tiles:
-            return out
+            return _out_orig if _out_orig is not out else self._to_output(out)
 
         for i, (sel, tile_shape) in enumerate(tiles):
             sid    = i % n_streams
@@ -1585,7 +1658,9 @@ class GPUDataset:
         for s in streams:
             s.synchronize()
 
-        return out
+        if _out_orig is not out:
+            return _out_orig
+        return self._to_output(out)
 
     def read_chunks_compressed(self, out=None, stream=None, transform=None):
         """Read a compressed, chunked HDF5 dataset to the GPU via a
