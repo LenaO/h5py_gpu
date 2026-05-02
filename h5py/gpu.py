@@ -1091,22 +1091,51 @@ class GPUDataset:
                     stream.synchronize()
 
         else:
-            # ── 3D: one chunk at a time (existing approach) ────────────────
-            touched = list(_iter_touched_chunks(dataset.shape, chunks, sel))
-            if not touched:
-                return _out_orig if _torch_out else self._to_output(out)
-
-            _fill_buf(0, touched[0][0], touched[0][1])
-            for i, (cfs, acs, ls, os) in enumerate(touched):
-                cur = i % 2
-                nxt = 1 - cur
-                _async_h2d_subtile(bufs[cur].ctypes.data, acs, ls, out, os, stream)
+            # ── 3D fast path: full-slice batch ─────────────────────────────
+            # When chunks=(1,H,W) and the selection covers complete H×W slices
+            # (dims 1 and 2 fully selected), collapse B separate HDF5 reads and
+            # B H2D calls into one read_direct + one memcpyAsync.
+            # The pinned buffer (slot 0 of the cache) is grown to B×H×W bytes
+            # on first use and reused thereafter — no per-call allocation.
+            _, _H, _W = dataset.shape
+            _full_slices = (
+                chunks[0] == 1
+                and sel[1].start == 0 and sel[1].stop == _H
+                and sel[2].start == 0 and sel[2].stop == _W
+            )
+            if _full_slices:
+                _B      = sel[0].stop - sel[0].start
+                _nbytes = _B * _H * _W * dtype.itemsize
+                _pm     = cache.get_bufs(1, _nbytes)[0]
+                _pinned = np.frombuffer(_pm, dtype=dtype,
+                                        count=_B * _H * _W).reshape(_B, _H, _W)
+                dataset.read_direct(_pinned,
+                                     source_sel=(sel[0], slice(None), slice(None)))
+                cp.cuda.runtime.memcpyAsync(
+                    out.data.ptr, _pinned.ctypes.data, _nbytes,
+                    cp.cuda.runtime.memcpyHostToDevice, stream.ptr,
+                )
                 if transform is not None:
                     with stream:
-                        out[os] = transform(out[os])
-                if i + 1 < len(touched):
-                    _fill_buf(nxt, touched[i + 1][0], touched[i + 1][1])
+                        out[:] = transform(out[:])
                 stream.synchronize()
+            else:
+                # ── 3D: one chunk at a time (double-buffered fallback) ──────
+                touched = list(_iter_touched_chunks(dataset.shape, chunks, sel))
+                if not touched:
+                    return _out_orig if _torch_out else self._to_output(out)
+
+                _fill_buf(0, touched[0][0], touched[0][1])
+                for i, (cfs, acs, ls, os) in enumerate(touched):
+                    cur = i % 2
+                    nxt = 1 - cur
+                    _async_h2d_subtile(bufs[cur].ctypes.data, acs, ls, out, os, stream)
+                    if transform is not None:
+                        with stream:
+                            out[os] = transform(out[os])
+                    if i + 1 < len(touched):
+                        _fill_buf(nxt, touched[i + 1][0], touched[i + 1][1])
+                    stream.synchronize()
 
         if _torch_out:
             return _out_orig
