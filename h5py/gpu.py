@@ -1141,6 +1141,63 @@ class GPUDataset:
             return _out_orig
         return self._to_output(out)
 
+    def read_batch_async(self, start, stop):
+        """Async full-slice batch read: submits H2D and returns immediately.
+
+        Like ``self[start:stop]`` for 3-D datasets chunked ``(1, H, W)``, but
+        does **not** call ``stream.synchronize()`` before returning.  The
+        caller must wait on the returned event before reading the data::
+
+            arr, event = gpu_ds.read_batch_async(0, 16)
+            # ... do other CPU work (e.g. start the next HDF5 read) ...
+            event.synchronize()
+            # arr is now safe to use
+
+        Falls back to a synchronous read (event already satisfied on return)
+        when the fast-path conditions are not met.
+
+        Parameters
+        ----------
+        start, stop : int
+            Slice range along axis 0.
+
+        Returns
+        -------
+        (array, cupy.cuda.Event)
+        """
+        _require_cupy()
+        dataset = object.__getattribute__(self, "_gpu_dataset")
+        cache   = object.__getattribute__(self, "_gpu_cache")
+        dtype   = np.dtype(dataset.dtype)
+
+        if (dataset.ndim == 3
+                and dataset.chunks is not None
+                and dataset.chunks[0] == 1):
+            _, _H, _W = dataset.shape
+            _B      = stop - start
+            _nbytes = _B * _H * _W * dtype.itemsize
+            out     = cp.empty((_B, _H, _W), dtype=dtype)
+            _pm     = cache.get_bufs(1, _nbytes)[0]
+            _pinned = np.frombuffer(_pm, dtype=dtype,
+                                    count=_B * _H * _W).reshape(_B, _H, _W)
+            dataset.read_direct(_pinned,
+                                 source_sel=(slice(start, stop),
+                                             slice(None), slice(None)))
+            stream = cache.stream
+            cp.cuda.runtime.memcpyAsync(
+                out.data.ptr, _pinned.ctypes.data, _nbytes,
+                cp.cuda.runtime.memcpyHostToDevice, stream.ptr,
+            )
+            event = cp.cuda.Event()
+            event.record(stream)
+            return self._to_output(out), event
+
+        # Synchronous fallback: event is already satisfied when we return
+        result = self[start:stop]
+        event  = cp.cuda.Event()
+        event.record(cache.stream)
+        return result, event
+
     def read_double_buffered(self, chunk_size=None, out=None, stream=None,
                              transform=None, sel=None, col_align=32):
         """Read the entire dataset to the GPU using double-buffered I/O.
