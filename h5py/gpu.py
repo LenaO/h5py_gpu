@@ -1141,7 +1141,7 @@ class GPUDataset:
             return _out_orig
         return self._to_output(out)
 
-    def read_batch_async(self, start, stop):
+    def read_batch_async(self, start, stop, out=None):
         """Async full-slice batch read: submits H2D and returns immediately.
 
         Like ``self[start:stop]`` for 3-D datasets chunked ``(1, H, W)``, but
@@ -1160,6 +1160,23 @@ class GPUDataset:
         ----------
         start, stop : int
             Slice range along axis 0.
+        out : cupy.ndarray, optional
+            Pre-allocated output array with shape ``(stop-start, H, W)`` and
+            the correct dtype.  When provided, no new GPU allocation is made,
+            which bounds peak GPU memory when many batches are in flight.
+
+            The caller **must not** read *out* until the returned event has
+            been synchronised.  A typical double-buffering pattern::
+
+                buf_a = cp.empty((B, H, W), dtype=ds.dtype)
+                buf_b = cp.empty((B, H, W), dtype=ds.dtype)
+                arr_a, ev_a = gpu_ds.read_batch_async(0,  B, out=buf_a)
+                for i in range(1, n_batches):
+                    arr_b, ev_b = gpu_ds.read_batch_async(i*B, (i+1)*B, out=buf_b)
+                    ev_a.synchronize()
+                    process(arr_a)          # safe: transfer complete
+                    arr_a, ev_a = arr_b, ev_b
+                    buf_a, buf_b = buf_b, buf_a  # swap roles
 
         Returns
         -------
@@ -1176,7 +1193,18 @@ class GPUDataset:
             _, _H, _W = dataset.shape
             _B      = stop - start
             _nbytes = _B * _H * _W * dtype.itemsize
-            out     = cp.empty((_B, _H, _W), dtype=dtype)
+            if out is None:
+                out = cp.empty((_B, _H, _W), dtype=dtype)
+            else:
+                if not isinstance(out, cp.ndarray):
+                    raise TypeError(
+                        f"out must be a cupy.ndarray, got {type(out)!r}"
+                    )
+                if out.shape != (_B, _H, _W) or out.dtype != dtype:
+                    raise ValueError(
+                        f"out shape/dtype {out.shape}/{out.dtype} does not "
+                        f"match expected {(_B, _H, _W)}/{dtype}"
+                    )
             _pm     = cache.get_bufs(1, _nbytes)[0]
             _pinned = np.frombuffer(_pm, dtype=dtype,
                                     count=_B * _H * _W).reshape(_B, _H, _W)
