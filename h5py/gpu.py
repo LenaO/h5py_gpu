@@ -1910,12 +1910,20 @@ class GPUDataset:
 
             # Two pinned buffers for COMPRESSED bytes (much smaller than
             # uncompressed_nb for high-compression datasets).
-            pms  = [cp.cuda.alloc_pinned_memory(max_comp_nb) for _ in range(2)]
-            bufs = [np.frombuffer(pm, dtype=np.uint8, count=max_comp_nb)
-                    for pm in pms]
+            pms  = cache.get_bufs(2, max_comp_nb)
+            bufs = [np.frombuffer(pms[i], dtype=np.uint8, count=max_comp_nb)
+                    for i in range(2)]
 
             # One GPU buffer for the compressed payload (reused per chunk).
             gpu_comp = cp.empty(max_comp_nb, dtype=cp.uint8)
+
+            # Pre-allocate reusable GPU buffers for decompressed data.
+            # decomp_cp receives each tile's decompressed bytes (D2D copy from
+            # nvCOMP output); gpu_full is used by the unshuffle kernel.
+            # Both are sized for the largest possible (full) chunk and are safe
+            # to reuse because the stream is synchronised after every tile.
+            decomp_cp = cp.empty(uncompressed_nb, dtype=cp.uint8)
+            gpu_full  = cp.empty(max_elems, dtype=dtype) if has_shuffle else None
 
             from nvidia import nvcomp as _nv
 
@@ -1956,7 +1964,6 @@ class GPUDataset:
 
                 if is_raw_block:
                     # LZ4 "stored raw" block: payload IS the uncompressed data.
-                    decomp_cp   = cp.empty(payload_nb, dtype=cp.uint8)
                     cp.cuda.runtime.memcpyAsync(
                         decomp_cp.data.ptr, gpu_comp.data.ptr,
                         payload_nb,
@@ -1976,7 +1983,6 @@ class GPUDataset:
                                                cuda_stream=stream.ptr)
                     _decomp_ref = nvcomp_codec.decode(comp_arr)
                     decomp_view = cp.from_dlpack(_decomp_ref)
-                    decomp_cp   = cp.empty(decomp_view.shape, dtype=decomp_view.dtype)
                     cp.cuda.runtime.memcpyAsync(
                         decomp_cp.data.ptr, decomp_view.data.ptr,
                         decomp_view.nbytes,
@@ -1987,7 +1993,6 @@ class GPUDataset:
                 with stream:
                     if has_shuffle:
                         shuffled = decomp_cp.view(cp.uint8)
-                        gpu_full = cp.empty(max_elems, dtype=dtype)
                         total    = uncompressed_nb
                         thr      = 256
                         blk      = (total + thr - 1) // thr
@@ -2051,18 +2056,21 @@ class GPUDataset:
             # of the nvCOMP Codec with the cleanup of CUDA arrays (CuPy pinned
             # memory, device arrays), causing an access violation on Windows.
             del nvcomp_codec, nvcomp_result
-            del gpu_comp, bufs, pms
+            del gpu_comp, decomp_cp, gpu_full, bufs, pms
 
         else:
             # ── CPU decompression path ─────────────────────────────────────────
             # Two pinned host buffers — each holds one FULL decompressed chunk
             # (padded with fill values for edge tiles).
-            pms  = [cp.cuda.alloc_pinned_memory(uncompressed_nb) for _ in range(2)]
-            bufs = [np.frombuffer(pm, dtype=np.uint8, count=uncompressed_nb)
-                    for pm in pms]
+            pms  = cache.get_bufs(2, uncompressed_nb)
+            bufs = [np.frombuffer(pms[i], dtype=np.uint8, count=uncompressed_nb)
+                    for i in range(2)]
 
             # GPU scratch for the unshuffle path.
             gpu_scratch      = cp.empty(uncompressed_nb, dtype=cp.uint8) if has_shuffle else None
+            # Pre-allocate gpu_full once; safe to reuse because the stream is
+            # synchronised after every tile before the next tile writes into it.
+            gpu_full         = cp.empty(max_elems, dtype=dtype) if has_shuffle else None
             unshuffle_kernel = _get_unshuffle_kernel() if has_shuffle else None
             threads          = 256
 
@@ -2077,7 +2085,6 @@ class GPUDataset:
                         gpu_scratch.data.ptr, pinned_buf.ctypes.data,
                         uncompressed_nb, H2D, stream.ptr,
                     )
-                    gpu_full = cp.empty(max_elems, dtype=dtype)
                     total    = uncompressed_nb
                     blocks   = (total + threads - 1) // threads
                     with stream:
@@ -2145,6 +2152,11 @@ class GPUDataset:
                     _decompress_into(bufs[nxt], tuple(s.start for s in next_sel))
 
                 stream.synchronize()
+
+            # Release GPU scratch buffers immediately (mirrors the nvCOMP path's
+            # explicit del) so CuPy's pool can reclaim them before the caller
+            # allocates the next dataset's output array.
+            del gpu_scratch, gpu_full
 
         return out
 
