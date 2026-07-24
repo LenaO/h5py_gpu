@@ -717,6 +717,21 @@ class _PinnedBufferCache:
     always call ``stream.synchronize()`` before returning, so consecutive
     calls on the same dataset are never in flight simultaneously.
 
+    By default this stream is created internally and never seen outside
+    this class. A caller that will go on to use the returned arrays on a
+    *different* stream -- e.g. a CUDA-resident PyTorch tensor imported via
+    DLPack and then read by ``model(imgs)`` on ``torch``'s own current
+    stream -- can instead supply that stream explicitly (see *stream* below).
+    Without this, CuPy's memory pool cannot tell that a block freed after
+    being used on the foreign stream is actually safe to reuse (it only
+    tracks activity on the stream *it* issued the allocation on), and instead
+    of risking an unsafe reuse it allocates a fresh block from the driver
+    every time -- so the pool's total footprint grows without bound even
+    though at any instant most of it is idle. Passing the same stream that
+    will do the downstream reads eliminates the ambiguity: there is only one
+    stream, so CuPy's own tracking is accurate and freed blocks are reused
+    normally.
+
     .. warning::
         Not thread-safe.  Do not use the same ``GPUDataset`` from multiple
         threads concurrently (h5py itself has the same restriction).
@@ -724,13 +739,18 @@ class _PinnedBufferCache:
 
     __slots__ = ('_slots', '_stream')
 
-    def __init__(self):
+    def __init__(self, stream=None):
         self._slots  = []   # list of [capacity_bytes, MemoryPointer]
-        self._stream = None
+        self._stream = stream
 
     @property
     def stream(self):
-        """Non-blocking CUDA stream, created on first access."""
+        """CUDA stream for this dataset's transfers.
+
+        The stream passed to the owning :class:`GPUDataset` at construction
+        time, or a lazily-created private non-blocking stream if none was
+        given.
+        """
         if self._stream is None:
             self._stream = cp.cuda.Stream(non_blocking=True)
         return self._stream
@@ -780,9 +800,28 @@ class GPUDataset:
     ----------
     dataset : h5py.Dataset
         An open h5py dataset.
+    backend : {'cupy', 'torch'}, optional
+        Array type returned by methods that allocate their own output
+        (default ``'cupy'``).
+    stream : cupy.cuda.Stream, optional
+        CUDA stream used for every transfer and kernel this dataset issues.
+        By default a private stream is created internally and never shared.
+        Pass one explicitly if the returned arrays will be read on a
+        *different* stream than the one doing the transfer -- most notably
+        when ``backend='torch'`` and the caller will run model code on
+        ``torch``'s own current stream. Without this, CuPy's memory pool
+        cannot recognise a block freed after being touched on that other
+        stream as safe to reuse and keeps allocating fresh ones instead, so
+        the pool's footprint grows without bound over many batches even
+        though most of it is idle at any instant. Wrap a foreign stream
+        (e.g. PyTorch's) with :class:`cupy.cuda.ExternalStream`::
+
+            import torch, cupy as cp
+            stream = cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream)
+            gpu_ds = GPUDataset(dataset, backend="torch", stream=stream)
     """
 
-    def __init__(self, dataset, backend="cupy"):
+    def __init__(self, dataset, backend="cupy", stream=None):
         if not isinstance(dataset, Dataset):
             raise TypeError(
                 f"GPUDataset requires an h5py.Dataset, got {type(dataset)!r}"
@@ -794,7 +833,7 @@ class GPUDataset:
             _require_torch()
         # Store under mangled names so __getattr__ does not recurse
         object.__setattr__(self, "_gpu_dataset", dataset)
-        object.__setattr__(self, "_gpu_cache", _PinnedBufferCache())
+        object.__setattr__(self, "_gpu_cache", _PinnedBufferCache(stream=stream))
         object.__setattr__(self, "_gpu_backend", backend)
 
     # ------------------------------------------------------------------
