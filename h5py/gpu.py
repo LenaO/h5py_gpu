@@ -1219,10 +1219,13 @@ class GPUDataset:
                         f"out shape/dtype {out.shape}/{out.dtype} does not "
                         f"match expected {(_B, _H, _W)}/{dtype}"
                     )
-            # Two independent pinned slots so that two calls in flight at once
-            # (different buf_idx) never share a staging buffer -- see the
-            # buf_idx note above.
-            _pm     = cache.get_bufs(2, _nbytes)[buf_idx]
+            # Only grow the cache up to the slot actually requested: a caller
+            # that always passes buf_idx=0 (i.e. never overlaps two calls)
+            # should keep paying for exactly one pinned slot, not two. Slot 1
+            # is only allocated once a caller actually requests buf_idx=1 --
+            # see the buf_idx note above for why two *different* slots matter
+            # once a caller does overlap calls.
+            _pm     = cache.get_bufs(buf_idx + 1, _nbytes)[buf_idx]
             _pinned = np.frombuffer(_pm, dtype=dtype,
                                     count=_B * _H * _W).reshape(_B, _H, _W)
             dataset.read_direct(_pinned,
