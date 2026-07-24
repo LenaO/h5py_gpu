@@ -1628,6 +1628,16 @@ class GPUDataset:
             ``cupy.ndarray`` (0-D)::
 
                 arr, total = gpu_ds.read_chunks_to_gpu(reduce_fn=cp.sum)
+
+            Avoiding a second pass does not always mean faster wall-clock
+            time: measured on real datasets, this fused reduction was 15-30%
+            *slower* than loading first and reducing the resident array
+            separately, because reducing a chunk in its final (placed) slot
+            costs more per chunk on the GPU than reducing a small standalone
+            buffer would, and that per-chunk cost is paid hundreds of times
+            for a typical HDF5-chunked dataset. Prefer :meth:`preload` (or
+            plain ``read_chunks_to_gpu()``) followed by a separate reduction
+            unless profiling on your own data shows otherwise.
         combine_fn : callable, optional
             Applied to the 1-D ``partial`` array (shape ``(n_tiles,)``) to
             produce the final reduction result.  Defaults to *reduce_fn*,
@@ -3132,6 +3142,19 @@ class GPUCachedDataset:
         If the array is already cached, this is equivalent to
         :meth:`reduce` (a single GPU-only pass, no I/O) -- there is nothing
         left to fuse with once the load has already happened.
+
+        Measured trade-off: fusing helps when the dataset streams as a
+        handful of large row-bands (contiguous datasets, the usual case for
+        :meth:`GPUDataset.read_double_buffered`) -- there, this is never
+        slower than :meth:`preload` followed by :meth:`reduce`, and is
+        sometimes faster. It currently does *not* help when the dataset
+        streams as many small chunks (HDF5-chunked datasets, the usual case
+        for :meth:`GPUDataset.read_chunks_to_gpu`): benchmarked there, it was
+        15-30% *slower* than the two-step ``preload()`` + ``reduce()``,
+        because a per-piece GPU cost that's negligible over a few large
+        bands accumulates over hundreds of small chunks. For a chunked
+        dataset, prefer ``preload()`` then ``reduce()`` unless profiling your
+        own data shows this method is faster for it.
 
         Parameters
         ----------
