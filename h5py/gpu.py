@@ -822,6 +822,8 @@ class GPUDataset:
     """
 
     def __init__(self, dataset, backend="cupy", stream=None):
+        """Wrap an already-open h5py.Dataset. See the class docstring above
+        for what *backend* and *stream* control."""
         if not isinstance(dataset, Dataset):
             raise TypeError(
                 f"GPUDataset requires an h5py.Dataset, got {type(dataset)!r}"
@@ -875,13 +877,23 @@ class GPUDataset:
     def __getitem__(self, args):
         """Read a slice from HDF5 into GPU memory.
 
-        Accepts the same indexing syntax as :class:`h5py.Dataset`.
+        Accepts the same indexing syntax as :class:`h5py.Dataset`. The
+        dispatch target depends only on the dataset's storage layout, never
+        on which method the caller happens to know about: a plain (step-1)
+        slice selection always gets the double-buffered treatment, whether
+        the dataset is HDF5-chunked or contiguous.
 
-        For HDF5-chunked 2-D and 3-D datasets with simple slice selections,
-        reading is automatically dispatched to :meth:`read_selection_chunked`,
-        which reads each touched HDF5 chunk in full (mirroring HDF5's own
-        behaviour) and uses double-buffering to overlap storage reads with
-        host-to-device transfers.  All other cases use the simple path.
+        For HDF5-chunked 2-D and 3-D datasets, reading is dispatched to
+        :meth:`read_selection_chunked`, which reads each touched HDF5 chunk
+        in full (mirroring HDF5's own behaviour) and uses double-buffering
+        to overlap storage reads with host-to-device transfers. For
+        contiguous datasets of any dimensionality, reading is dispatched to
+        :meth:`read_double_buffered` instead, which applies the same
+        overlap row-band-wise (its own small-selection fast path already
+        keeps trivial reads cheap, so this adds no overhead for those).
+        Fancy indexing, stepped slices, integer indices, and chunked
+        datasets outside 2-D/3-D fall back to a single h5py read followed
+        by one pinned-memory transfer.
 
         Returns
         -------
@@ -890,12 +902,15 @@ class GPUDataset:
         """
         dataset = object.__getattribute__(self, "_gpu_dataset")
 
-        # Fast path: chunked 2-D/3-D with a plain slice selection
-        if dataset.chunks is not None and dataset.ndim in (2, 3):
-            _args = args if isinstance(args, tuple) else (args,)
-            sel, out_shape = _normalize_sel(_args, dataset.shape)
-            if sel is not None:
+        _args = args if isinstance(args, tuple) else (args,)
+        sel, out_shape = _normalize_sel(_args, dataset.shape)
+        if sel is not None:
+            if dataset.chunks is not None and dataset.ndim in (2, 3):
                 return self.read_selection_chunked(sel)
+            if dataset.chunks is None:
+                return self.read_double_buffered(sel=sel)
+            # Chunked dataset outside 2-D/3-D: no chunk-aware fast path
+            # exists for it yet, fall through to the naive path below.
 
         # Fall back: let h5py handle the selection, then transfer to GPU
         arr = dataset[args]
@@ -3007,14 +3022,17 @@ class GPUDataset:
         return f"<GPUDataset wrapping {dataset!r}>"
 
     def __len__(self):
+        """Size of the first axis, delegated to the underlying h5py.Dataset."""
         dataset = object.__getattribute__(self, "_gpu_dataset")
         return len(dataset)
 
     def __iter__(self):
+        """Iterate over the first axis, delegated to the underlying h5py.Dataset."""
         dataset = object.__getattribute__(self, "_gpu_dataset")
         return iter(dataset)
 
     def __contains__(self, item):
+        """Membership test, delegated to the underlying h5py.Dataset."""
         dataset = object.__getattribute__(self, "_gpu_dataset")
         return item in dataset
 
@@ -3067,6 +3085,8 @@ class GPUCachedDataset:
     """
 
     def __init__(self, dataset, preload=True):
+        """Wrap an h5py.Dataset or an existing GPUDataset. See the class
+        docstring above for what *preload* controls."""
         if isinstance(dataset, GPUDataset):
             self._gpu_ds = dataset
         elif isinstance(dataset, Dataset):
@@ -3269,9 +3289,11 @@ class GPUCachedDataset:
     # ------------------------------------------------------------------
 
     def __enter__(self):
+        """Context-manager entry; returns self."""
         return self
 
     def __exit__(self, *_):
+        """Context-manager exit: releases the cached GPU array (see :meth:`free`)."""
         self.free()
 
     # ------------------------------------------------------------------
@@ -3302,6 +3324,7 @@ class GPUGroup:
     """
 
     def __init__(self, group):
+        """Wrap an already-open h5py.Group or h5py.File."""
         if not isinstance(group, Group):
             raise TypeError(
                 f"GPUGroup requires an h5py.Group (or File), got {type(group)!r}"
@@ -3314,6 +3337,9 @@ class GPUGroup:
     # ------------------------------------------------------------------
 
     def __getitem__(self, name):
+        """Index by path, like h5py.Group, but wrapping the result: a
+        Dataset comes back as a :class:`GPUDataset`, a Group as a nested
+        :class:`GPUGroup`; anything else is returned unwrapped."""
         group = object.__getattribute__(self, "_gpu_group")
         item = group[name]
         if isinstance(item, Dataset):
@@ -3327,14 +3353,17 @@ class GPUGroup:
     # ------------------------------------------------------------------
 
     def __iter__(self):
+        """Iterate over member names, delegated to the underlying h5py.Group."""
         group = object.__getattribute__(self, "_gpu_group")
         return iter(group)
 
     def __len__(self):
+        """Number of members, delegated to the underlying h5py.Group."""
         group = object.__getattribute__(self, "_gpu_group")
         return len(group)
 
     def __contains__(self, name):
+        """Membership test, delegated to the underlying h5py.Group."""
         group = object.__getattribute__(self, "_gpu_group")
         return name in group
 
@@ -3355,9 +3384,11 @@ class GPUGroup:
     # ------------------------------------------------------------------
 
     def __enter__(self):
+        """Context-manager entry; returns self."""
         return self
 
     def __exit__(self, *args):
+        """Context-manager exit, delegated to the underlying h5py.Group/File."""
         group = object.__getattribute__(self, "_gpu_group")
         group.__exit__(*args)
 
@@ -3377,6 +3408,7 @@ class GPUFile(GPUGroup):
     """
 
     def __init__(self, *args, **kwargs):
+        """Open an HDF5 file; all arguments are forwarded to h5py.File."""
         _require_cupy()
         file_obj = File(*args, **kwargs)
         # Bypass GPUGroup.__init__ to avoid the isinstance check on File
