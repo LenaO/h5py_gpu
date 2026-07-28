@@ -447,6 +447,26 @@ def _iter_tiles(shape, chunks):
         yield sel, tile_shape
 
 
+# Target pinned-buffer size (per slot) for contiguous datasets when the
+# caller does not pass chunk_size explicitly. Fixed regardless of dataset
+# size, so the default row-band size -- and hence host memory -- stays
+# bounded the same way it already is for HDF5-chunked datasets (which get a
+# row-band size tied to their own fixed chunk shape, never to how many
+# chunks the dataset has). Without this, a fraction-of-dataset default (as
+# used previously) makes host memory for the "default settings" case scale
+# with dataset size for contiguous data specifically -- see
+# benchmark_host_memory_sweep.py in the accompanying repository for the
+# measured effect.
+_DEFAULT_CONTIGUOUS_CHUNK_BYTES = 4 * 1024 * 1024  # 4 MB per buffer slot
+
+
+def _default_contiguous_chunk_size(n_rows, row_nbytes):
+    """Row-band size for a contiguous dataset with no explicit chunk_size:
+    targets _DEFAULT_CONTIGUOUS_CHUNK_BYTES per pinned buffer slot,
+    independent of n_rows."""
+    return max(1, min(n_rows, _DEFAULT_CONTIGUOUS_CHUNK_BYTES // max(1, row_nbytes)))
+
+
 def _async_h2d_tile(src_ptr, tile_shape, out, sel, stream):
     """Submit async H2D DMA for one tile from pinned memory into ``out[sel]``.
 
@@ -996,10 +1016,20 @@ class GPUDataset:
         dtype  = np.dtype(dataset.dtype)
         chunks = dataset.chunks
 
+        cache = object.__getattribute__(self, "_gpu_cache")
+        if stream is None:
+            stream = cache.stream
+
         out, _out_orig = GPUDataset._normalize_out(out)
         _torch_out = _out_orig is not out  # True only when caller passed a torch.Tensor
         if out is None:
-            out = cp.empty(out_shape, dtype=dtype)
+            # Allocated inside stream's context -- see the matching comment
+            # in read_chunks_to_gpu for why this matters (raw memcpy2DAsync
+            # calls on `stream` bypass CuPy's own stream tracking, so a
+            # fresh array must be tied to `stream` from allocation time to
+            # get correct cross-stream reuse safety from CuPy's pool).
+            with stream:
+                out = cp.empty(out_shape, dtype=dtype)
         else:
             if not isinstance(out, cp.ndarray):
                 raise TypeError(
@@ -1012,10 +1042,6 @@ class GPUDataset:
                 )
             if not out.flags["C_CONTIGUOUS"]:
                 raise ValueError("out must be C-contiguous")
-
-        cache = object.__getattribute__(self, "_gpu_cache")
-        if stream is None:
-            stream = cache.stream
 
         # Two pinned host buffers — each big enough for one full (max) chunk.
         # Used for edge chunks in the 2D path and for all chunks in 3D.
@@ -1261,8 +1287,13 @@ class GPUDataset:
             _, _H, _W = dataset.shape
             _B      = stop - start
             _nbytes = _B * _H * _W * dtype.itemsize
+            stream  = cache.stream
             if out is None:
-                out = cp.empty((_B, _H, _W), dtype=dtype)
+                # Allocated inside stream's context -- see the matching
+                # comment in read_chunks_to_gpu for why (raw memcpyAsync
+                # below bypasses CuPy's own stream tracking).
+                with stream:
+                    out = cp.empty((_B, _H, _W), dtype=dtype)
             else:
                 if not isinstance(out, cp.ndarray):
                     raise TypeError(
@@ -1285,7 +1316,6 @@ class GPUDataset:
             dataset.read_direct(_pinned,
                                  source_sel=(slice(start, stop),
                                              slice(None), slice(None)))
-            stream = cache.stream
             cp.cuda.runtime.memcpyAsync(
                 out.data.ptr, _pinned.ctypes.data, _nbytes,
                 cp.cuda.runtime.memcpyHostToDevice, stream.ptr,
@@ -1333,7 +1363,9 @@ class GPUDataset:
             reduce Python overhead; smaller values increase overlap
             opportunities.  Defaults to ``dataset.chunks[0]`` for HDF5-chunked
             datasets (aligns reads to chunk boundaries, avoiding partial-chunk
-            decompression), or ``max(1, sel_rows // 8)`` for contiguous datasets.
+            decompression), or a size targeting a fixed ~4 MB pinned buffer
+            for contiguous datasets -- independent of dataset size, so host
+            memory for the default case does not grow with it.
         out : cupy.ndarray, optional
             Pre-allocated output array whose shape must match the selected
             region ``(sel_rows, *row_shape)`` and have the correct dtype.
@@ -1508,7 +1540,7 @@ class GPUDataset:
                 # decompress a chunk and discard part of it.
                 chunk_size = hdf5_chunks[0]
             else:
-                chunk_size = max(1, sel_rows // 8)
+                chunk_size = _default_contiguous_chunk_size(sel_rows, row_nbytes)
         chunk_size = min(chunk_size, sel_rows)
 
         cache = object.__getattribute__(self, "_gpu_cache")
@@ -1518,7 +1550,11 @@ class GPUDataset:
         # Allocate (or validate) output GPU array — shape matches the selection
         out_shape = (sel_rows,) + row_shape
         if out is None:
-            out = cp.empty(out_shape, dtype=dtype)
+            # Allocated inside stream's context -- see the matching comment
+            # in read_chunks_to_gpu for why (raw memcpy2DAsync/memcpyAsync
+            # calls below bypass CuPy's own stream tracking).
+            with stream:
+                out = cp.empty(out_shape, dtype=dtype)
         else:
             if not isinstance(out, cp.ndarray):
                 raise TypeError(
@@ -1547,7 +1583,8 @@ class GPUDataset:
             if combine_fn is None:
                 combine_fn = reduce_fn
             _probe  = reduce_fn(cp.zeros(1, dtype=dtype))
-            partial = cp.empty(len(chunk_starts), dtype=_probe.dtype)
+            with stream:
+                partial = cp.empty(len(chunk_starts), dtype=_probe.dtype)
 
         # --- Prime the pipeline: fill buf[0] with the first row-band ---
         end0 = min(r0 + chunk_size, r1)
@@ -1732,10 +1769,27 @@ class GPUDataset:
         chunks = dataset.chunks
         dtype  = np.dtype(dataset.dtype)
 
+        cache = object.__getattribute__(self, "_gpu_cache")
+        if stream is None:
+            stream = cache.stream
+
         out, _out_orig = GPUDataset._normalize_out(out)
         _torch_out = _out_orig is not out
         if out is None:
-            out = cp.empty(shape, dtype=dtype)
+            # Allocated *inside* stream's context, not on whatever stream
+            # happens to be current in plain Python (usually the default
+            # stream): every subsequent write to `out` goes through raw
+            # cp.cuda.runtime.memcpy2DAsync calls on `stream`, which bypass
+            # CuPy's own operation-level stream tracking entirely. If `out`
+            # were allocated under a different stream, CuPy's memory pool
+            # could hand back a block still being written by unrelated,
+            # unsynchronized work on that other stream -- a real,
+            # measured, intermittent data race (values silently reflecting
+            # a mix of stale and new writes), not merely a theoretical one.
+            # Allocating here ties the block to `stream` from the start, so
+            # the pool's own cross-stream reuse safety applies correctly.
+            with stream:
+                out = cp.empty(shape, dtype=dtype)
         else:
             if not isinstance(out, cp.ndarray):
                 raise TypeError(
@@ -1748,10 +1802,6 @@ class GPUDataset:
                 )
             if not out.flags["C_CONTIGUOUS"]:
                 raise ValueError("out must be C-contiguous")
-
-        cache = object.__getattribute__(self, "_gpu_cache")
-        if stream is None:
-            stream = cache.stream
 
         # Two pinned host buffers — each sized for one full (max) chunk.
         # Edge tiles are smaller but always fit.
@@ -1768,7 +1818,8 @@ class GPUDataset:
             if combine_fn is None:
                 combine_fn = reduce_fn
             _probe  = reduce_fn(cp.zeros(1, dtype=dtype))
-            partial = cp.empty(len(tiles), dtype=_probe.dtype)
+            with stream:
+                partial = cp.empty(len(tiles), dtype=_probe.dtype)
 
         # Prime the pipeline: read first tile directly into pinned buf[0]
         first_sel, first_shape = tiles[0]
@@ -1888,6 +1939,18 @@ class GPUDataset:
         _torch_out = _out_orig is not out
         if out is None:
             out = cp.empty(shape, dtype=dtype)
+            # `out` is written by N independent streams below via raw
+            # memcpy2DAsync calls that bypass CuPy's own stream tracking
+            # (see the matching comment in read_chunks_to_gpu for the
+            # single-stream case). There, allocating inside `with stream:`
+            # is enough, because CuPy's pool only needs to protect that one
+            # stream. Here it is not: CuPy would only insert a cross-stream
+            # reuse wait for whichever ONE stream `out` was allocated under,
+            # leaving the other N-1 streams' raw writes unprotected against
+            # a block that may still be in use by unrelated, unsynchronized
+            # work elsewhere. A full device sync -- paid once, before any
+            # of the N streams start -- protects all of them uniformly.
+            cp.cuda.Device().synchronize()
         else:
             if not isinstance(out, cp.ndarray):
                 raise TypeError(
@@ -2052,8 +2115,16 @@ class GPUDataset:
         chunks = dataset.chunks
         dtype  = np.dtype(dataset.dtype)
 
+        cache = object.__getattribute__(self, "_gpu_cache")
+        if stream is None:
+            stream = cache.stream
+
         if out is None:
-            out = cp.empty(shape, dtype=dtype)
+            # Allocated inside stream's context -- see the matching comment
+            # in read_chunks_to_gpu for why (raw memcpy2DAsync/memcpyAsync
+            # calls below bypass CuPy's own stream tracking).
+            with stream:
+                out = cp.empty(shape, dtype=dtype)
         else:
             if not isinstance(out, cp.ndarray):
                 raise TypeError(f"out must be a cupy.ndarray, got {type(out)!r}")
@@ -2064,10 +2135,6 @@ class GPUDataset:
                 )
             if not out.flags["C_CONTIGUOUS"]:
                 raise ValueError("out must be C-contiguous")
-
-        cache = object.__getattribute__(self, "_gpu_cache")
-        if stream is None:
-            stream = cache.stream
 
         max_elems       = int(np.prod(chunks))
         uncompressed_nb = max_elems * dtype.itemsize   # bytes per full chunk
@@ -2108,16 +2175,22 @@ class GPUDataset:
             bufs = [np.frombuffer(pms[i], dtype=np.uint8, count=max_comp_nb)
                     for i in range(2)]
 
-            # One GPU buffer for the compressed payload (reused per chunk).
-            gpu_comp = cp.empty(max_comp_nb, dtype=cp.uint8)
+            # These scratch buffers are written via raw runtime calls and
+            # nvCOMP's own C-level API on `stream`, bypassing CuPy's stream
+            # tracking -- see the comment on `out`'s allocation above (same
+            # reasoning applies to any fresh buffer these paths write to).
+            with stream:
+                # One GPU buffer for the compressed payload (reused per chunk).
+                gpu_comp = cp.empty(max_comp_nb, dtype=cp.uint8)
 
-            # Pre-allocate reusable GPU buffers for decompressed data.
-            # decomp_cp receives each tile's decompressed bytes (D2D copy from
-            # nvCOMP output); gpu_full is used by the unshuffle kernel.
-            # Both are sized for the largest possible (full) chunk and are safe
-            # to reuse because the stream is synchronised after every tile.
-            decomp_cp = cp.empty(uncompressed_nb, dtype=cp.uint8)
-            gpu_full  = cp.empty(max_elems, dtype=dtype) if has_shuffle else None
+                # Pre-allocate reusable GPU buffers for decompressed data.
+                # decomp_cp receives each tile's decompressed bytes (D2D copy
+                # from nvCOMP output); gpu_full is used by the unshuffle
+                # kernel. Both are sized for the largest possible (full)
+                # chunk and are safe to reuse because the stream is
+                # synchronised after every tile.
+                decomp_cp = cp.empty(uncompressed_nb, dtype=cp.uint8)
+                gpu_full  = cp.empty(max_elems, dtype=dtype) if has_shuffle else None
 
             from nvidia import nvcomp as _nv
 
@@ -2260,11 +2333,17 @@ class GPUDataset:
             bufs = [np.frombuffer(pms[i], dtype=np.uint8, count=uncompressed_nb)
                     for i in range(2)]
 
-            # GPU scratch for the unshuffle path.
-            gpu_scratch      = cp.empty(uncompressed_nb, dtype=cp.uint8) if has_shuffle else None
-            # Pre-allocate gpu_full once; safe to reuse because the stream is
-            # synchronised after every tile before the next tile writes into it.
-            gpu_full         = cp.empty(max_elems, dtype=dtype) if has_shuffle else None
+            # Allocated inside stream's context -- these are written via raw
+            # runtime calls and the unshuffle kernel on `stream`, bypassing
+            # CuPy's stream tracking (see the comment on `out`'s allocation
+            # above).
+            with stream:
+                # GPU scratch for the unshuffle path.
+                gpu_scratch  = cp.empty(uncompressed_nb, dtype=cp.uint8) if has_shuffle else None
+                # Pre-allocate gpu_full once; safe to reuse because the stream
+                # is synchronised after every tile before the next tile
+                # writes into it.
+                gpu_full     = cp.empty(max_elems, dtype=dtype) if has_shuffle else None
             unshuffle_kernel = _get_unshuffle_kernel() if has_shuffle else None
             threads          = 256
 
@@ -2469,11 +2548,17 @@ class GPUDataset:
         pms  = cache.get_bufs(2, max_elems * dtype.itemsize)
         bufs = [np.frombuffer(pms[i], dtype=dtype, count=max_elems) for i in range(2)]
 
-        # Single reusable GPU temp buffer (safe: always synced before reuse)
-        gpu_temp = cp.empty(max_elems, dtype=dtype)
+        # Allocated inside stream's context -- gpu_temp is written via raw
+        # memcpyAsync on `stream`, bypassing CuPy's stream tracking (see the
+        # comment on `out`'s allocation in read_chunks_to_gpu). partial is
+        # wrapped too for consistency/safety even though its writes go
+        # through CuPy's own tracked __setitem__.
+        with stream:
+            # Single reusable GPU temp buffer (safe: always synced before reuse)
+            gpu_temp = cp.empty(max_elems, dtype=dtype)
 
-        # One partial result per tile
-        partial = cp.empty(len(tiles), dtype=out_dtype)
+            # One partial result per tile
+            partial = cp.empty(len(tiles), dtype=out_dtype)
 
         def _fill_buf(idx, tile_sel, tile_shp):
             """Read one HDF5 tile directly into pinned buffer *idx* (no
@@ -2536,7 +2621,8 @@ class GPUDataset:
             Applied to each band before *reduce_fn*, on the same stream.
         chunk_size : int, optional
             Number of rows per band.  Defaults to ``dataset.chunks[0]`` for
-            HDF5-chunked datasets, or ``max(1, nrows // 8)`` otherwise.
+            HDF5-chunked datasets, or a size targeting a fixed ~4 MB pinned
+            buffer otherwise -- independent of dataset size.
         stream : cupy.cuda.Stream, optional
 
         Returns
@@ -2564,7 +2650,8 @@ class GPUDataset:
 
         if chunk_size is None:
             hdf5_chunks = dataset.chunks
-            chunk_size = hdf5_chunks[0] if hdf5_chunks else max(1, n_rows // 8)
+            chunk_size = (hdf5_chunks[0] if hdf5_chunks
+                         else _default_contiguous_chunk_size(n_rows, row_nbytes))
         chunk_size = min(chunk_size, n_rows)
 
         cache = object.__getattribute__(self, "_gpu_cache")
@@ -2585,11 +2672,15 @@ class GPUDataset:
                               count=int(np.prod(buf_shape))).reshape(buf_shape)
                 for k in range(2)]
 
-        # Reusable GPU temp buffer (one band at a time)
-        gpu_temp = cp.empty(buf_shape, dtype=dtype)
+        # Allocated inside stream's context -- see the matching comment in
+        # reduce_chunks (gpu_temp is written via raw memcpyAsync on `stream`,
+        # bypassing CuPy's stream tracking).
+        with stream:
+            # Reusable GPU temp buffer (one band at a time)
+            gpu_temp = cp.empty(buf_shape, dtype=dtype)
 
-        # Partial results: one per band
-        partial = cp.empty(len(chunk_starts), dtype=out_dtype)
+            # Partial results: one per band
+            partial = cp.empty(len(chunk_starts), dtype=out_dtype)
 
         # Prime: read first band
         end0 = min(chunk_size, n_rows)
@@ -2683,7 +2774,8 @@ class GPUDataset:
             Source array on the GPU.  Must match the dataset's shape and dtype.
         chunk_size : int, optional
             Rows per I/O band.  Defaults to ``dataset.chunks[0]`` for chunked
-            datasets, or ``max(1, nrows // 8)`` for contiguous ones.
+            datasets, or a size targeting a fixed ~4 MB pinned buffer for
+            contiguous ones (independent of dataset size).
         stream : cupy.cuda.Stream, optional
             CUDA stream for D2H transfers.  A new non-blocking stream is
             created when *None*.
@@ -2712,7 +2804,8 @@ class GPUDataset:
 
         if chunk_size is None:
             hdf5_chunks = dataset.chunks
-            chunk_size = hdf5_chunks[0] if hdf5_chunks else max(1, n_rows // 8)
+            chunk_size = (hdf5_chunks[0] if hdf5_chunks
+                         else _default_contiguous_chunk_size(n_rows, row_nbytes))
         chunk_size = min(chunk_size, n_rows)
 
         cache = object.__getattribute__(self, "_gpu_cache")
