@@ -906,7 +906,8 @@ class GPUDataset:
         For HDF5-chunked 2-D and 3-D datasets, reading is dispatched to
         :meth:`read_selection_chunked`, which reads each touched HDF5 chunk
         in full (mirroring HDF5's own behaviour) and uses double-buffering
-        to overlap storage reads with host-to-device transfers. For
+        to overlap storage reads with host-to-device transfers -- except for
+        a batched-whole-chunk fast path, see that method's docstring. For
         contiguous datasets of any dimensionality, reading is dispatched to
         :meth:`read_double_buffered` instead, which applies the same
         overlap row-band-wise (its own small-selection fast path already
@@ -957,7 +958,13 @@ class GPUDataset:
            reading the next chunk.
 
         Double-buffering overlaps step 2 for chunk *i+1* with step 3 for
-        chunk *i*.
+        chunk *i* -- except when the selection collapses into a run of
+        complete ``(1, H, W)`` chunks (e.g. a training loop's
+        ``ds[i:i+batch]``): that case is handled by a single-shot fast path
+        below instead, trading the double-buffered overlap (and the fixed,
+        per-chunk buffer size) for one read and one transfer instead of
+        *B* of each. Its pinned buffer is sized to the whole batch and
+        grows with batch size accordingly.
 
         Parameters
         ----------
@@ -2942,13 +2949,17 @@ class GPUDataset:
 
     def write_selection_chunked(self, src, sel, stream=None):
         """Write a CuPy array to a selection in a chunked HDF5 dataset,
-        processing one HDF5 chunk at a time with double-buffering.
+        with double-buffering.
 
-        Mirrors :meth:`read_selection_chunked`: for each HDF5 chunk that
-        overlaps the selection, ``memcpy2DAsync`` (D2H) extracts the relevant
-        sub-region from the GPU source array into a compact pinned buffer,
-        then h5py writes that buffer to the dataset (HDF5 handles any
-        read-modify-write internally for partial chunks):
+        Mirrors :meth:`read_selection_chunked`, including its 2-D
+        edge/interior split: partially-covered chunks are extracted and
+        written one at a time, while chunks fully covered by *sel* are
+        batched into row-bands -- one ``memcpy2DAsync`` (D2H) plus one
+        ``write_direct`` call per band, spanning every fully-covered
+        column-chunk in that row, instead of one call per chunk. 3-D
+        datasets fall back to one chunk at a time (matching
+        :meth:`read_selection_chunked`'s own 3-D behavior for
+        non-whole-slice selections).
 
         .. code-block:: text
 
@@ -3005,13 +3016,11 @@ class GPUDataset:
         if stream is None:
             stream = cache.stream
 
+        # Two pinned host buffers -- each big enough for one full (max) chunk.
+        # Used for edge chunks in the 2D path and for all chunks in 3D.
         max_elems = int(np.prod(chunks))
         pms  = cache.get_bufs(2, max_elems * dtype.itemsize)
         bufs = [np.frombuffer(pms[i], dtype=dtype, count=max_elems) for i in range(2)]
-
-        touched = list(_iter_touched_chunks(dataset.shape, chunks, sel))
-        if not touched:
-            return
 
         def _fill_buf_d2h(idx, src_sel, compact_shape):
             """Async D2H: src[src_sel] → compact pinned buf[idx]."""
@@ -3029,27 +3038,133 @@ class GPUDataset:
             )
             dataset.write_direct(view, dest_sel=dataset_sel)
 
-        # Prime: D2H first chunk's sub-region
-        cf0, _, lc0, src_sel0 = touched[0]
-        compact0 = tuple(s.stop - s.start for s in lc0)
-        _fill_buf_d2h(0, src_sel0, compact0)
-        stream.synchronize()
+        if dataset.ndim == 2:
+            # ── 2D optimized path ──────────────────────────────────────────
+            # Same edge/interior split as read_selection_chunked: edge chunks
+            # (partial in >=1 dim) one at a time; chunks fully covered by
+            # `sel` batched into row-bands, one D2H + one write_direct per
+            # band instead of one call per column-chunk in that row.
+            r0, r1 = sel[0].start, sel[0].stop
+            c0, c1 = sel[1].start, sel[1].stop
+            R, C   = dataset.shape
+            cr, cc = chunks
 
-        for i, (chunk_file_sel, _, local_sel, src_sel) in enumerate(touched):
-            cur = i % 2
-            nxt = 1 - cur
+            ri0 = r0 // cr;  ri1 = (r1 - 1) // cr
+            ci0 = c0 // cc;  ci1 = (c1 - 1) // cc
 
-            # 1. Async D2H for the NEXT chunk's sub-region
-            if i + 1 < len(touched):
-                cf_nxt, _, lc_nxt, ss_nxt = touched[i + 1]
-                compact_nxt = tuple(s.stop - s.start for s in lc_nxt)
-                _fill_buf_d2h(nxt, ss_nxt, compact_nxt)
+            ri_in0 = ri0 + (1 if r0 % cr else 0)
+            ri_in1 = ri1 - (1 if r1 % cr else 0)
+            ci_in0 = ci0 + (1 if c0 % cc else 0)
+            ci_in1 = ci1 - (1 if c1 % cc else 0)
 
-            # 2. Write current pinned buffer to HDF5 (overlaps D2H)
-            _write_chunk(cur, chunk_file_sel, local_sel)
+            has_interior = ri_in0 <= ri_in1 and ci_in0 <= ci_in1
 
-            # 3. Wait for D2H before reusing nxt buffer
+            edge_chunks = [
+                entry for entry in _iter_touched_chunks(dataset.shape, chunks, sel)
+                if not (ri_in0 <= entry[0][0].start // cr <= ri_in1
+                        and ci_in0 <= entry[0][1].start // cc <= ci_in1)
+            ]
+
+            # ── Phase 1: edge chunks ────────────────────────────────────────
+            if edge_chunks:
+                cf0, _, lc0, ss0 = edge_chunks[0]
+                compact0 = tuple(s.stop - s.start for s in lc0)
+                _fill_buf_d2h(0, ss0, compact0)
+                stream.synchronize()
+                for i, (chunk_file_sel, _, local_sel, src_sel) in enumerate(edge_chunks):
+                    cur = i % 2
+                    nxt = 1 - cur
+                    if i + 1 < len(edge_chunks):
+                        cf_nxt, _, lc_nxt, ss_nxt = edge_chunks[i + 1]
+                        compact_nxt = tuple(s.stop - s.start for s in lc_nxt)
+                        _fill_buf_d2h(nxt, ss_nxt, compact_nxt)
+                    _write_chunk(cur, chunk_file_sel, local_sel)
+                    stream.synchronize()
+
+            # ── Phase 2: interior row-bands ─────────────────────────────────
+            if has_interior:
+                c_in_start  = ci_in0 * cc
+                c_in_end    = (ci_in1 + 1) * cc
+                n_in_cols   = c_in_end - c_in_start
+                oc_in_start = c_in_start - c0
+                oc_in_end   = c_in_end   - c0
+
+                row_band_nbytes = cr * n_in_cols * dtype.itemsize
+                row_pms  = cache.get_bufs(2, row_band_nbytes)
+                row_bufs = [np.frombuffer(row_pms[i], dtype=dtype,
+                                          count=cr * n_in_cols)
+                            for i in range(2)]
+
+                n_row_bands = ri_in1 - ri_in0 + 1
+
+                def _fill_row_band_d2h(buf_idx, ri):
+                    """D2H: src's row-band sub-region → compact pinned buffer."""
+                    r_s  = ri * cr
+                    r_e  = min(r_s + cr, R)
+                    or_s = r_s - r0
+                    or_e = r_e - r0
+                    _async_d2h_subtile(
+                        row_bufs[buf_idx].ctypes.data, (r_e - r_s, n_in_cols),
+                        src, (slice(or_s, or_e), slice(oc_in_start, oc_in_end)),
+                        stream,
+                    )
+
+                def _write_row_band(buf_idx, ri):
+                    """Write the compact pinned row-band buffer to the dataset."""
+                    r_s  = ri * cr
+                    r_e  = min(r_s + cr, R)
+                    nr   = r_e - r_s
+                    view = np.frombuffer(row_pms[buf_idx], dtype=dtype,
+                                         count=nr * n_in_cols).reshape(nr, n_in_cols)
+                    dataset.write_direct(view, dest_sel=(slice(r_s, r_e),
+                                                         slice(c_in_start, c_in_end)))
+
+                # Prime: D2H first interior row-band
+                _fill_row_band_d2h(0, ri_in0)
+                stream.synchronize()
+
+                for j in range(n_row_bands):
+                    cur = j % 2
+                    nxt = 1 - cur
+                    ri  = ri_in0 + j
+
+                    # 1. Async D2H for the NEXT row-band's sub-region
+                    if j + 1 < n_row_bands:
+                        _fill_row_band_d2h(nxt, ri_in0 + j + 1)
+
+                    # 2. Write current pinned row-band to HDF5 (overlaps D2H)
+                    _write_row_band(cur, ri)
+
+                    # 3. Wait for D2H before reusing nxt buffer
+                    stream.synchronize()
+
+        else:
+            # ── 3D: one chunk at a time (double-buffered fallback) ──────────
+            touched = list(_iter_touched_chunks(dataset.shape, chunks, sel))
+            if not touched:
+                return
+
+            # Prime: D2H first chunk's sub-region
+            cf0, _, lc0, src_sel0 = touched[0]
+            compact0 = tuple(s.stop - s.start for s in lc0)
+            _fill_buf_d2h(0, src_sel0, compact0)
             stream.synchronize()
+
+            for i, (chunk_file_sel, _, local_sel, src_sel) in enumerate(touched):
+                cur = i % 2
+                nxt = 1 - cur
+
+                # 1. Async D2H for the NEXT chunk's sub-region
+                if i + 1 < len(touched):
+                    cf_nxt, _, lc_nxt, ss_nxt = touched[i + 1]
+                    compact_nxt = tuple(s.stop - s.start for s in lc_nxt)
+                    _fill_buf_d2h(nxt, ss_nxt, compact_nxt)
+
+                # 2. Write current pinned buffer to HDF5 (overlaps D2H)
+                _write_chunk(cur, chunk_file_sel, local_sel)
+
+                # 3. Wait for D2H before reusing nxt buffer
+                stream.synchronize()
 
     def read_direct_gpu(self, dest, source_sel=None, dest_sel=None):
         """Read HDF5 data directly into a pre-allocated :class:`cupy.ndarray`.
